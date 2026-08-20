@@ -1,9 +1,10 @@
 //! SQLite storage for chunks and embeddings.
 
 use crate::embed::{self, MODEL_ID};
-use crate::index::Chunk;
+use crate::index::{Chunk, CHUNKER_VERSION};
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -18,8 +19,16 @@ pub struct Document {
     pub vector: Vec<f32>,
 }
 
+/// One file to upsert during incremental index.
+pub struct FileUpdate<'a> {
+    pub source_path: &'a str,
+    pub content_hash: &'a str,
+    pub chunks: &'a [Chunk],
+    pub vectors: &'a [Vec<f32>],
+}
+
 pub struct Db {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Db {
@@ -50,6 +59,11 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS files (
+  source_path TEXT PRIMARY KEY,
+  content_hash TEXT NOT NULL
+);
 "#,
         )?;
         Ok(Self { conn })
@@ -57,8 +71,9 @@ CREATE TABLE IF NOT EXISTS meta (
 
     #[allow(dead_code)]
     pub fn clear(&self) -> Result<()> {
-        self.conn
-            .execute_batch("DELETE FROM embeddings; DELETE FROM documents; DELETE FROM meta;")?;
+        self.conn.execute_batch(
+            "DELETE FROM embeddings; DELETE FROM documents; DELETE FROM files; DELETE FROM meta;",
+        )?;
         Ok(())
     }
 
@@ -81,6 +96,8 @@ CREATE TABLE IF NOT EXISTS meta (
         Ok(())
     }
 
+    /// Full rebuild used by tests (and as a reference for the table layout).
+    #[cfg(test)]
     pub fn replace_all(
         &mut self,
         chunks: &[Chunk],
@@ -96,57 +113,98 @@ CREATE TABLE IF NOT EXISTS meta (
         }
         let tx = self.conn.transaction()?;
         // Preserve meta.instructions unless the caller supplies a new value.
-        tx.execute_batch("DELETE FROM embeddings; DELETE FROM documents;")?;
-        {
-            let mut doc_stmt = tx.prepare(
-                "INSERT INTO documents (source_path, chunk_index, text, headings, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            let mut emb_stmt =
-                tx.prepare("INSERT INTO embeddings (id, dim, vector) VALUES (?1, ?2, ?3)")?;
+        tx.execute_batch("DELETE FROM embeddings; DELETE FROM documents; DELETE FROM files;")?;
+        insert_chunks(&tx, chunks, vectors)?;
+        write_file_hashes(&tx, chunks)?;
+        write_index_meta(&tx, instructions)?;
+        tx.commit()?;
+        Ok(())
+    }
 
-            for (c, vec) in chunks.iter().zip(vectors.iter()) {
-                if vec.is_empty() {
-                    bail!("empty vector for {}[{}]", c.source_path, c.chunk_index);
-                }
-                if vec.len() != embed::DIM {
-                    bail!(
-                        "vector dim {} != expected {} for {}[{}]",
-                        vec.len(),
-                        embed::DIM,
-                        c.source_path,
-                        c.chunk_index
-                    );
-                }
-                let headings = serde_json::to_string(&c.headings)?;
-                let metadata = serde_json::to_string(&c.metadata)?;
-                doc_stmt.execute(params![
-                    c.source_path,
-                    c.chunk_index as i64,
-                    c.text,
-                    headings,
-                    metadata
-                ])?;
-                let id = tx.last_insert_rowid();
-                emb_stmt.execute(params![id, vec.len() as i64, float32_to_bytes(vec)])?;
+    /// Hashes from the `files` table (empty on DBs that predate the table).
+    pub fn file_hashes(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_path, content_hash FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (path, hash) = row?;
+            out.insert(path, hash);
+        }
+        Ok(out)
+    }
+
+    /// Distinct `source_path` values in `documents`.
+    pub fn source_paths(&self) -> Result<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT source_path FROM documents")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// True when hashes cannot be trusted and every collected file must be
+    /// re-embedded (missing/legacy meta, model change, or chunker change).
+    pub fn needs_full_reembed(&self) -> Result<bool> {
+        if self.count()? == 0 {
+            return Ok(false);
+        }
+        match self.get_meta("model_id")? {
+            Some(m) if m == MODEL_ID => {}
+            _ => return Ok(true),
+        }
+        match self.get_meta("dim")? {
+            Some(d) if d == embed::DIM.to_string() => {}
+            _ => return Ok(true),
+        }
+        match self.get_meta("chunker_version")? {
+            Some(v) if v == CHUNKER_VERSION => {}
+            _ => return Ok(true),
+        }
+        if self.file_hashes()?.is_empty() {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Apply per-file upserts and optional deletes in one transaction.
+    pub fn apply_index(
+        &mut self,
+        updates: &[FileUpdate<'_>],
+        prune: &[String],
+        instructions: Option<&str>,
+    ) -> Result<()> {
+        for u in updates {
+            if u.chunks.len() != u.vectors.len() {
+                bail!(
+                    "chunks ({}) and vectors ({}) length mismatch for {}",
+                    u.chunks.len(),
+                    u.vectors.len(),
+                    u.source_path
+                );
             }
         }
-        tx.execute(
-            "INSERT INTO meta(key, value) VALUES ('model_id', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![MODEL_ID],
-        )?;
-        tx.execute(
-            "INSERT INTO meta(key, value) VALUES ('dim', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![embed::DIM.to_string()],
-        )?;
-        if let Some(text) = instructions {
+        let tx = self.conn.transaction()?;
+        for path in prune {
+            delete_source_path(&tx, path)?;
+        }
+        for u in updates {
+            delete_source_path(&tx, u.source_path)?;
+            insert_chunks(&tx, u.chunks, u.vectors)?;
             tx.execute(
-                "INSERT INTO meta(key, value) VALUES ('instructions', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![text],
+                "INSERT INTO files (source_path, content_hash) VALUES (?1, ?2)
+                 ON CONFLICT(source_path) DO UPDATE SET content_hash = excluded.content_hash",
+                params![u.source_path, u.content_hash],
             )?;
         }
+        write_index_meta(&tx, instructions)?;
         tx.commit()?;
         Ok(())
     }
@@ -295,6 +353,88 @@ ORDER BY d.id
     }
 }
 
+fn delete_source_path(tx: &Transaction<'_>, path: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM documents WHERE source_path = ?1",
+        params![path],
+    )?;
+    tx.execute("DELETE FROM files WHERE source_path = ?1", params![path])?;
+    Ok(())
+}
+
+fn insert_chunks(tx: &Transaction<'_>, chunks: &[Chunk], vectors: &[Vec<f32>]) -> Result<()> {
+    let mut doc_stmt = tx.prepare(
+        "INSERT INTO documents (source_path, chunk_index, text, headings, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut emb_stmt =
+        tx.prepare("INSERT INTO embeddings (id, dim, vector) VALUES (?1, ?2, ?3)")?;
+
+    for (c, vec) in chunks.iter().zip(vectors.iter()) {
+        if vec.is_empty() {
+            bail!("empty vector for {}[{}]", c.source_path, c.chunk_index);
+        }
+        if vec.len() != embed::DIM {
+            bail!(
+                "vector dim {} != expected {} for {}[{}]",
+                vec.len(),
+                embed::DIM,
+                c.source_path,
+                c.chunk_index
+            );
+        }
+        let headings = serde_json::to_string(&c.headings)?;
+        let metadata = serde_json::to_string(&c.metadata)?;
+        doc_stmt.execute(params![
+            c.source_path,
+            c.chunk_index as i64,
+            c.text,
+            headings,
+            metadata
+        ])?;
+        let id = tx.last_insert_rowid();
+        emb_stmt.execute(params![id, vec.len() as i64, float32_to_bytes(vec)])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_file_hashes(tx: &Transaction<'_>, chunks: &[Chunk]) -> Result<()> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<&str, Vec<&Chunk>> = BTreeMap::new();
+    for c in chunks {
+        groups.entry(c.source_path.as_str()).or_default().push(c);
+    }
+    let mut stmt = tx.prepare(
+        "INSERT INTO files (source_path, content_hash) VALUES (?1, ?2)
+         ON CONFLICT(source_path) DO UPDATE SET content_hash = excluded.content_hash",
+    )?;
+    for (path, mut group) in groups {
+        group.sort_by_key(|c| c.chunk_index);
+        let hash = crate::index::hash_chunks(group);
+        stmt.execute(params![path, hash])?;
+    }
+    Ok(())
+}
+
+fn upsert_meta(tx: &Transaction<'_>, key: &str, value: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn write_index_meta(tx: &Transaction<'_>, instructions: Option<&str>) -> Result<()> {
+    upsert_meta(tx, "model_id", MODEL_ID)?;
+    upsert_meta(tx, "dim", &embed::DIM.to_string())?;
+    upsert_meta(tx, "chunker_version", CHUNKER_VERSION)?;
+    if let Some(text) = instructions {
+        upsert_meta(tx, "instructions", text)?;
+    }
+    Ok(())
+}
+
 fn float32_to_bytes(v: &[f32]) -> Vec<u8> {
     let mut b = Vec::with_capacity(v.len() * 4);
     for f in v {
@@ -376,5 +516,86 @@ mod tests {
             db.get_meta("instructions").unwrap().as_deref(),
             Some("via set_meta")
         );
+    }
+
+    fn chunk(path: &str, text: &str) -> Chunk {
+        Chunk {
+            source_path: path.into(),
+            chunk_index: 0,
+            text: text.into(),
+            headings: vec![],
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    fn dummy_vec() -> Vec<f32> {
+        vec![1.0f32; embed::DIM]
+    }
+
+    #[test]
+    fn replace_all_records_file_hashes_and_chunker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut db = Db::open(&path).unwrap();
+        let chunks = vec![chunk("a.md", "hello"), chunk("b.md", "world")];
+        let vectors = vec![dummy_vec(), dummy_vec()];
+        db.replace_all(&chunks, &vectors, None).unwrap();
+        assert!(!db.needs_full_reembed().unwrap());
+        let hashes = db.file_hashes().unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(
+            hashes.get("a.md").unwrap(),
+            &crate::index::hash_chunks(std::iter::once(&chunks[0]))
+        );
+        assert_eq!(
+            db.get_meta("chunker_version").unwrap().as_deref(),
+            Some(CHUNKER_VERSION)
+        );
+    }
+
+    #[test]
+    fn apply_index_upserts_and_prunes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut db = Db::open(&path).unwrap();
+        let a = chunk("a.md", "aaa");
+        let b = chunk("b.md", "bbb");
+        db.replace_all(&[a.clone(), b.clone()], &[dummy_vec(), dummy_vec()], None)
+            .unwrap();
+
+        let a2 = chunk("a.md", "aaa-edited");
+        let hash = crate::index::hash_chunks(std::iter::once(&a2));
+        let vecs = [dummy_vec()];
+        db.apply_index(
+            &[FileUpdate {
+                source_path: "a.md",
+                content_hash: &hash,
+                chunks: std::slice::from_ref(&a2),
+                vectors: &vecs,
+            }],
+            &["b.md".into()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(db.count().unwrap(), 1);
+        let docs = db.load_all().unwrap();
+        assert_eq!(docs[0].source_path, "a.md");
+        assert_eq!(docs[0].text, "aaa-edited");
+        let hashes = db.file_hashes().unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes.get("a.md").unwrap(), &hash);
+        assert!(!hashes.contains_key("b.md"));
+    }
+
+    #[test]
+    fn legacy_db_without_file_hashes_needs_full_reembed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut db = Db::open(&path).unwrap();
+        let chunks = vec![chunk("a.md", "hello")];
+        db.replace_all(&chunks, &[dummy_vec()], None).unwrap();
+        db.conn.execute("DELETE FROM files", []).unwrap();
+        assert!(db.needs_full_reembed().unwrap());
     }
 }

@@ -37,6 +37,12 @@ enum Commands {
         /// Embedding batch size
         #[arg(long, default_value_t = 16)]
         batch: usize,
+        /// Re-embed every collected file even if content hashes match
+        #[arg(long)]
+        full: bool,
+        /// Upsert collected files only; do not delete paths missing from --input
+        #[arg(long)]
+        update: bool,
         /// MCP server instructions stored in DB meta (when to call this corpus)
         #[arg(long)]
         instructions: Option<String>,
@@ -101,9 +107,20 @@ fn main() -> Result<()> {
             db,
             dry_run,
             batch,
+            full,
+            update,
             instructions,
             instructions_file,
-        } => run_index(input, db, dry_run, batch, instructions, instructions_file),
+        } => run_index(IndexRun {
+            input,
+            db_path: db,
+            dry_run,
+            batch,
+            full,
+            update,
+            instructions,
+            instructions_file,
+        }),
         Commands::Serve { db } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_serve(db))
@@ -122,13 +139,35 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_index(
+struct IndexRun {
     input: PathBuf,
     db_path: PathBuf,
     dry_run: bool,
     batch: usize,
+    full: bool,
+    update: bool,
     instructions: Option<String>,
     instructions_file: Option<PathBuf>,
+}
+
+struct PreparedFile {
+    path: String,
+    hash: String,
+    chunks: Vec<index::Chunk>,
+    vectors: Vec<Vec<f32>>,
+}
+
+fn run_index(
+    IndexRun {
+        input,
+        db_path,
+        dry_run,
+        batch,
+        full,
+        update,
+        instructions,
+        instructions_file,
+    }: IndexRun,
 ) -> Result<()> {
     let chunks = index::collect(&input)?;
     if chunks.is_empty() {
@@ -160,26 +199,105 @@ fn run_index(
         }
     }
 
-    println!(
-        "indexing {} chunks from {} -> {} ({})",
-        chunks.len(),
-        input.display(),
-        db_path.display(),
-        embed::MODEL_ID
-    );
-    let mut emb = embed::Embedder::new()?;
-    let batch = batch.max(1);
-    let mut vectors = Vec::with_capacity(chunks.len());
-    for i in (0..chunks.len()).step_by(batch) {
-        let end = (i + batch).min(chunks.len());
-        eprintln!("  embedding {}-{}/{}", i + 1, end, chunks.len());
-        let texts: Vec<String> = chunks[i..end].iter().map(|c| c.text.clone()).collect();
-        let batch_vecs = emb.embed_batch(&texts)?;
-        vectors.extend(batch_vecs);
-    }
+    let grouped = index::group_chunks_by_path(chunks);
+    let files: Vec<(String, String, Vec<index::Chunk>)> = grouped
+        .into_iter()
+        .map(|(path, group)| {
+            let hash = index::hash_chunks(group.iter());
+            (path, hash, group)
+        })
+        .collect();
 
     let mut db = store::Db::open(&db_path)?;
-    db.replace_all(&chunks, &vectors, instructions.as_deref())?;
+    let force_full = full || db.needs_full_reembed()?;
+    let mut existing = db.file_hashes()?;
+    for path in db.source_paths()? {
+        existing.entry(path).or_default();
+    }
+    let incoming_hashes: Vec<(String, String)> = files
+        .iter()
+        .map(|(p, h, _)| (p.clone(), h.clone()))
+        .collect();
+    let plan = index::plan_index(&incoming_hashes, &existing, !update, force_full);
+
+    println!(
+        "indexing {} files from {} -> {} ({}){}",
+        files.len(),
+        input.display(),
+        db_path.display(),
+        embed::MODEL_ID,
+        if force_full && !full {
+            " [full re-embed: model or chunker changed]"
+        } else if full {
+            " [--full]"
+        } else {
+            ""
+        }
+    );
+    if !plan.skip.is_empty() {
+        eprintln!("  skip {} unchanged", plan.skip.len());
+    }
+    if !plan.embed.is_empty() {
+        eprintln!(
+            "  embed {} file(s): {}",
+            plan.embed.len(),
+            plan.embed.join(", ")
+        );
+    }
+    if !plan.prune.is_empty() {
+        eprintln!(
+            "  prune {} removed: {}",
+            plan.prune.len(),
+            plan.prune.join(", ")
+        );
+    }
+    if update {
+        eprintln!("  --update: not pruning paths missing from input");
+    }
+
+    let embed_set: std::collections::HashSet<&str> =
+        plan.embed.iter().map(|s| s.as_str()).collect();
+    let mut updates: Vec<PreparedFile> = Vec::new();
+    if plan.embed.is_empty() {
+        let _ = files;
+        if plan.prune.is_empty() && instructions.is_none() {
+            println!("nothing to do; {}", db.summary()?);
+            return Ok(());
+        }
+    } else {
+        let mut emb = embed::Embedder::new()?;
+        let batch = batch.max(1);
+        for (path, hash, group) in files {
+            if !embed_set.contains(path.as_str()) {
+                continue;
+            }
+            let mut vectors = Vec::with_capacity(group.len());
+            for i in (0..group.len()).step_by(batch) {
+                let end = (i + batch).min(group.len());
+                eprintln!("  embedding {} {}-{}/{}", path, i + 1, end, group.len());
+                let texts: Vec<String> = group[i..end].iter().map(|c| c.text.clone()).collect();
+                let batch_vecs = emb.embed_batch(&texts)?;
+                vectors.extend(batch_vecs);
+            }
+            updates.push(PreparedFile {
+                path,
+                hash,
+                chunks: group,
+                vectors,
+            });
+        }
+    }
+
+    let file_updates: Vec<store::FileUpdate<'_>> = updates
+        .iter()
+        .map(|f| store::FileUpdate {
+            source_path: &f.path,
+            content_hash: &f.hash,
+            chunks: &f.chunks,
+            vectors: &f.vectors,
+        })
+        .collect();
+    db.apply_index(&file_updates, &plan.prune, instructions.as_deref())?;
     if let Some(text) = db.get_meta("instructions")? {
         eprintln!(
             "MCP instructions ({} chars): {}",

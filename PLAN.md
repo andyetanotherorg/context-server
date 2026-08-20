@@ -24,8 +24,8 @@ context-server embed "<query>"   # query-style (BGE instruction)
 | Module | Role |
 |--------|------|
 | `embed` | fastembed BGESmallENV15 (384-dim, L2-normalized); query instruction on search; `MODEL_ID` constant |
-| `index` | Markdown heading chunker (`##` / `###`), oversized split + overlap |
-| `store` | SQLite: documents + embeddings + `meta` (model_id, dim) |
+| `index` | Markdown heading chunker (`##` / `###`), oversized split + overlap, per-file content hashes |
+| `store` | SQLite: documents + embeddings + `files` (content hashes) + `meta` (model_id, dim, chunker_version) |
 | `bm25` | In-memory BM25 + reciprocal rank fusion |
 | `search` | Hybrid dense + BM25 (default), or dense/lexical only |
 | `mcp` | rmcp stdio tools |
@@ -35,9 +35,10 @@ context-server embed "<query>"   # query-style (BGE instruction)
 
 - `documents`: id, source_path, chunk_index, text, headings (JSON), metadata (JSON)
 - `embeddings`: id, dim, vector (little-endian float32 blob)
-- `meta`: key/value (`model_id`, `dim`) — refuse search if incompatible
+- `files`: source_path, content_hash (SHA-256 of that file's chunks)
+- `meta`: key/value (`model_id`, `dim`, `chunker_version`) — refuse search if model incompatible; re-embed all files if chunker/model changed
 
-`index` replaces the full DB contents each run (`ReplaceAll`).
+`index` upserts changed files and deletes paths that left `--input`. `--full` re-embeds collected files; `--update` skips the prune.
 
 ## Chunking
 
@@ -70,9 +71,9 @@ Only `.md` / `.markdown` files are indexed. Structured sources (team YAML, etc.)
 - [x] Claude Code stdio MCP verified against a local knowledge base
 - [x] PyPI wheels via Containerfile + maturin
 - [x] Search filters (`path_prefix`, `heading`, `tag`) + `get_document` citations
+- [x] Incremental re-index (per-file content hash; prune missing paths)
 
 ## Roadmap
 
-1. Incremental re-index (per-file) instead of full ReplaceAll
-2. Optional stronger embedding models behind a flag
-3. Optional musl / static OpenSSL builds for fewer system deps
+1. Optional stronger embedding models behind a flag
+2. Optional musl / static OpenSSL builds for fewer system deps

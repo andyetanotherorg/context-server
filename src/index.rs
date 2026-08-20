@@ -2,6 +2,8 @@
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -11,6 +13,9 @@ use walkdir::WalkDir;
 pub const MAX_CHUNK_CHARS: usize = 1800;
 /// Overlap between consecutive splits of an oversized section.
 pub const CHUNK_OVERLAP_CHARS: usize = 200;
+/// Stored in DB meta; bump when chunking rules change so incremental index
+/// re-embeds even if file bytes look the same.
+pub const CHUNKER_VERSION: &str = "1";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -20,6 +25,101 @@ pub struct Chunk {
     pub headings: Vec<String>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
+
+/// SHA-256 of a file's chunks (index, text, headings, metadata). Used to skip
+/// re-embedding unchanged files. Hash post-chunk text so a chunker change
+/// invalidates without relying only on [`CHUNKER_VERSION`].
+pub fn hash_chunks<'a, I>(chunks: I) -> String
+where
+    I: IntoIterator<Item = &'a Chunk>,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-server-file-v1\0");
+    for c in chunks {
+        hasher.update((c.chunk_index as u64).to_le_bytes());
+        hasher.update((c.text.len() as u64).to_le_bytes());
+        hasher.update(c.text.as_bytes());
+        let headings = serde_json::to_string(&c.headings).unwrap_or_else(|_| "[]".into());
+        hasher.update((headings.len() as u64).to_le_bytes());
+        hasher.update(headings.as_bytes());
+        let metadata = serde_json::to_string(&c.metadata).unwrap_or_else(|_| "{}".into());
+        hasher.update((metadata.len() as u64).to_le_bytes());
+        hasher.update(metadata.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Group chunks by `source_path`, sorted by path then `chunk_index`.
+pub fn group_chunks_by_path(mut chunks: Vec<Chunk>) -> Vec<(String, Vec<Chunk>)> {
+    chunks.sort_by(|a, b| {
+        a.source_path
+            .cmp(&b.source_path)
+            .then(a.chunk_index.cmp(&b.chunk_index))
+    });
+    let mut out: Vec<(String, Vec<Chunk>)> = Vec::new();
+    for c in chunks {
+        if let Some((path, group)) = out.last_mut() {
+            if *path == c.source_path {
+                group.push(c);
+                continue;
+            }
+        }
+        let path = c.source_path.clone();
+        out.push((path, vec![c]));
+    }
+    out
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexPlan {
+    /// Unchanged files; leave existing rows alone.
+    pub skip: Vec<String>,
+    /// New or changed files (or everything when `full`).
+    pub embed: Vec<String>,
+    /// Paths in the DB that are no longer in the input (only when pruning).
+    pub prune: Vec<String>,
+}
+
+/// Decide which files to re-embed, skip, or delete.
+///
+/// `incoming` is `(source_path, content_hash)` for files in this index run.
+/// `existing` is hashes currently stored (and any document paths with an empty
+/// hash if the `files` table is missing a row).
+///
+/// When `prune` is true, paths in `existing` but not in `incoming` are removed.
+/// When `full` is true, every incoming file is re-embedded even if the hash matches.
+pub fn plan_index(
+    incoming: &[(String, String)],
+    existing: &HashMap<String, String>,
+    prune: bool,
+    full: bool,
+) -> IndexPlan {
+    let incoming_map: HashMap<&str, &str> = incoming
+        .iter()
+        .map(|(p, h)| (p.as_str(), h.as_str()))
+        .collect();
+
+    let mut plan = IndexPlan::default();
+    for (path, hash) in incoming {
+        if !full && existing.get(path).is_some_and(|old| old == hash) {
+            plan.skip.push(path.clone());
+        } else {
+            plan.embed.push(path.clone());
+        }
+    }
+    if prune {
+        for path in existing.keys() {
+            if !incoming_map.contains_key(path.as_str()) {
+                plan.prune.push(path.clone());
+            }
+        }
+    }
+    plan.skip.sort();
+    plan.embed.sort();
+    plan.prune.sort();
+    plan
+}
+
 /// Split markdown into chunks on ## and ### boundaries.
 pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
     let content = strip_front_matter(content);
@@ -339,5 +439,75 @@ Upstream repos use stable branches.
             );
             assert!(c.text.contains("Doc > Big") || c.headings.contains(&"Big".into()));
         }
+    }
+
+    fn chunk(path: &str, index: usize, text: &str) -> Chunk {
+        Chunk {
+            source_path: path.into(),
+            chunk_index: index,
+            text: text.into(),
+            headings: vec![],
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_changes_with_text() {
+        let a = [chunk("a.md", 0, "hello")];
+        let b = [chunk("a.md", 0, "hello")];
+        let c = [chunk("a.md", 0, "hello!")];
+        assert_eq!(hash_chunks(a.iter()), hash_chunks(b.iter()));
+        assert_ne!(hash_chunks(a.iter()), hash_chunks(c.iter()));
+    }
+
+    #[test]
+    fn group_chunks_by_path_sorts() {
+        let grouped = group_chunks_by_path(vec![
+            chunk("b.md", 0, "b"),
+            chunk("a.md", 1, "a1"),
+            chunk("a.md", 0, "a0"),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, "a.md");
+        assert_eq!(grouped[0].1[0].chunk_index, 0);
+        assert_eq!(grouped[0].1[1].chunk_index, 1);
+        assert_eq!(grouped[1].0, "b.md");
+    }
+
+    #[test]
+    fn plan_skips_unchanged_embeds_changed_prunes_missing() {
+        let incoming = vec![
+            ("keep.md".into(), "hash-keep".into()),
+            ("edit.md".into(), "hash-new".into()),
+            ("new.md".into(), "hash-new-file".into()),
+        ];
+        let existing = HashMap::from([
+            ("keep.md".into(), "hash-keep".into()),
+            ("edit.md".into(), "hash-old".into()),
+            ("gone.md".into(), "hash-gone".into()),
+        ]);
+        let plan = plan_index(&incoming, &existing, true, false);
+        assert_eq!(plan.skip, ["keep.md"]);
+        assert_eq!(plan.embed, ["edit.md", "new.md"]);
+        assert_eq!(plan.prune, ["gone.md"]);
+    }
+
+    #[test]
+    fn plan_update_does_not_prune() {
+        let incoming = vec![("a.md".into(), "h".into())];
+        let existing = HashMap::from([("a.md".into(), "h".into()), ("b.md".into(), "x".into())]);
+        let plan = plan_index(&incoming, &existing, false, false);
+        assert_eq!(plan.skip, ["a.md"]);
+        assert!(plan.embed.is_empty());
+        assert!(plan.prune.is_empty());
+    }
+
+    #[test]
+    fn plan_full_reembeds_even_when_hash_matches() {
+        let incoming = vec![("a.md".into(), "h".into())];
+        let existing = HashMap::from([("a.md".into(), "h".into())]);
+        let plan = plan_index(&incoming, &existing, true, true);
+        assert!(plan.skip.is_empty());
+        assert_eq!(plan.embed, ["a.md"]);
     }
 }

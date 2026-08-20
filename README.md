@@ -137,6 +137,7 @@ Uses [Application Default Credentials](https://cloud.google.com/docs/authenticat
 
 ```text
 context-server index  --input <path> [--db FILE] [--dry-run] [--batch N]
+                      [--full] [--update]
                       [--instructions TEXT | --instructions-file FILE]
 context-server serve  --db <local path | gs://…>
 context-server search --db <local path | gs://…> [--limit N] [--mode hybrid|dense|lexical]
@@ -178,7 +179,7 @@ gh workflow run release.yml --repo context-server/context-server
 
 ## Design notes
 
-Under the hood: fastembed BGE-small-en-v1.5 (384-d, L2-normalized; query instruction applied at search time), rusqlite with float32 blobs, [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) over stdio. Each `index` run replaces the DB contents. Re-run `index` after upgrading if `MODEL_ID` changed.
+Under the hood: fastembed BGE-small-en-v1.5 (384-d, L2-normalized; query instruction applied at search time), rusqlite with float32 blobs, [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) over stdio. `index` is incremental by file: unchanged files (same post-chunk content hash) are skipped, so the embedding model is not loaded. Files missing from `--input` are removed. Pass `--full` to re-embed everything collected, or `--update` to upsert without deleting other paths. Re-run `index` after upgrading if `MODEL_ID` or the chunker version changed (that forces a full re-embed).
 
 More detail and roadmap: [PLAN.md](PLAN.md).
 
