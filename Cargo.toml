@@ -19,7 +19,7 @@ fastembed = "5"
 google-cloud-storage = "1.16.0"
 hex = "0.4.3"
 regex = "1"
-rmcp = { version = "2.2", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "3.1", features = ["server", "transport-io", "macros", "schemars"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23.42", features = ["aws-lc-rs"] }
 schemars = "1.2"
