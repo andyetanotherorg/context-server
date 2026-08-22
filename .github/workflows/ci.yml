@@ -15,6 +15,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - name: Check minimum supported Rust
+        run: cargo check --locked
+
   test:
     name: Test
     runs-on: ubuntu-24.04
@@ -42,6 +51,15 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Release binary smoke test
+        run: |
+          cargo build --release --locked
+          ./target/release/context-server --help
+          if ldd ./target/release/context-server | grep -q libonnxruntime; then
+            echo 'error: binary dynamically links libonnxruntime' >&2
+            exit 1
+          fi
 
   # Same platforms as release.yml. Native Ubuntu 24.04 builds (not Docker) so
   # Swatinem/rust-cache can reuse the release target between runs. Containerfile

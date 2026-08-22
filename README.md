@@ -158,7 +158,7 @@ cargo build --release
 cargo test
 ```
 
-Rust 1.75+, Linux x86_64 is the primary target. You need a C++ stdlib for the linker (`libstdc++`) and whatever OpenSSL/`native-tls` needs on your platform.
+Rust 1.88+, Linux x86_64 is the primary target. You need a C++ stdlib for the linker (`libstdc++`) and whatever OpenSSL/`native-tls` needs on your platform.
 
 On Fedora/RHEL, if the linker wants `-lstdc++` but only `libstdc++.so.6` exists:
 
