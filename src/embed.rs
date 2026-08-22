@@ -81,6 +81,13 @@ pub fn model_is_cached() -> Result<bool> {
         .any(|entry| entry.file_type().is_file() && entry.file_name() == "model.onnx"))
 }
 
+pub fn estimated_tokens(text: &str) -> usize {
+    text.split_whitespace()
+        .map(|word| word.chars().count().max(1).div_ceil(4))
+        .sum::<usize>()
+        .max(1)
+}
+
 fn l2_normalize(v: &mut [f32]) {
     let mut sum = 0.0f32;
     for x in v.iter() {

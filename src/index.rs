@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 /// Soft cap on embedded text length. BGE-small truncates around ~512 tokens;
 /// ~4 chars/token ⇒ keep chunks under this so the tail is not dropped.
 pub const MAX_CHUNK_CHARS: usize = 1800;
+pub const MAX_CHUNK_TOKENS: usize = 450;
 /// Overlap between consecutive splits of an oversized section.
 pub const CHUNK_OVERLAP_CHARS: usize = 200;
 /// Stored in DB meta; bump when chunking rules change so incremental index
@@ -294,6 +295,13 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
         let mut start = 0usize;
         while start < body_chars.len() {
             let mut end = (start + body_budget).min(body_chars.len());
+            while end > start + 1 {
+                let candidate: String = body_chars[start..end].iter().collect();
+                if crate::embed::estimated_tokens(&candidate) <= MAX_CHUNK_TOKENS {
+                    break;
+                }
+                end = start + ((end - start) * 9 / 10).max(1);
+            }
             // Prefer breaking on whitespace when not at the end.
             if end < body_chars.len() {
                 if let Some(rel) = body_chars[start..end]
