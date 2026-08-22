@@ -319,9 +319,9 @@ fn parse_front_matter(content: &str) -> (serde_json::Map<String, serde_json::Val
                 continue;
             }
 
-            if trimmed.starts_with("- ") {
+            if let Some(item_raw) = trimmed.strip_prefix("- ") {
                 if let Some(ref _key) = current_list_key {
-                    let item = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+                    let item = item_raw.trim().trim_matches('"').trim_matches('\'');
                     list_items.push(serde_json::Value::String(item.to_string()));
                     continue;
                 }
