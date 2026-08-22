@@ -132,6 +132,17 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: maturin sdist -o dist
 
+      - name: Install and smoke-test wheel
+        if: matrix.arch == 'x86_64'
+        run: |
+          python3 -m venv /tmp/context-server-smoke
+          /tmp/context-server-smoke/bin/pip install dist/*.whl
+          /tmp/context-server-smoke/bin/context-server --help
+          if ldd /tmp/context-server-smoke/bin/context-server | grep -q libonnxruntime; then
+            echo 'error: installed wheel dynamically links libonnxruntime' >&2
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.arch }}
