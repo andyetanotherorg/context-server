@@ -137,16 +137,8 @@ impl ContextService {
     ) -> String {
         let limit = limit.unwrap_or(50);
         let db = self.db.lock().unwrap();
-        match db.list(limit.saturating_mul(4).max(limit)) {
-            Ok(docs) => {
-                let filtered: Vec<_> = docs
-                    .into_iter()
-                    .filter(|d| match &path_prefix {
-                        Some(p) if !p.is_empty() => d.source_path.starts_with(p.as_str()),
-                        _ => true,
-                    })
-                    .take(limit)
-                    .collect();
+        match db.list(limit, path_prefix.as_deref()) {
+            Ok(filtered) => {
                 let mut out = format!("Showing {} document chunks:\n", filtered.len());
                 for d in filtered {
                     let preview = crate::index::truncate_preview(&d.text, 157);
