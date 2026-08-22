@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 const RRF_K: f32 = 60.0;
 /// How many candidates to take from each ranker before fusion.
 const CANDIDATE_POOL: usize = 50;
+const MIN_DENSE_SCORE: f32 = 0.30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -281,8 +282,19 @@ fn hybrid_rrf(docs: &[Document], dense: &[f32], lexical: &[f32], limit: usize) -
     } else {
         reciprocal_rank_fusion(&[dense_rank, lex_rank], RRF_K)
     };
+    let mut per_source = std::collections::HashMap::<&str, usize>::new();
     fused
         .into_iter()
+        .filter(|(i, _)| lexical[*i] > 0.0 || dense[*i] >= MIN_DENSE_SCORE)
+        .filter(|(i, _)| {
+            let count = per_source.entry(docs[*i].source_path.as_str()).or_default();
+            if *count >= 2 {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        })
         .take(limit)
         .map(|(i, score)| hit_from(docs, i, score, dense[i], lexical[i]))
         .collect()
