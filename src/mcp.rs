@@ -11,13 +11,16 @@ use rmcp::{
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+const MAX_SEARCH_RESULTS: usize = 20;
+const MAX_LIST_RESULTS: usize = 200;
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchRequest {
     #[schemars(
         description = "Natural-language search query. Include names, teams, acronyms, or topic keywords (e.g. 'who manages the storage team', 'backport process')."
     )]
     pub query: String,
-    #[schemars(description = "Max passages to return (default 5)")]
+    #[schemars(description = "Max passages to return (default 5, maximum 20)")]
     pub limit: Option<usize>,
     #[schemars(
         description = "Only search chunks whose source_path starts with this prefix (e.g. 'teams/' or 'guides/')."
@@ -35,7 +38,7 @@ pub struct SearchRequest {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListRequest {
-    #[schemars(description = "Max chunks to list (default 50)")]
+    #[schemars(description = "Max chunks to list (default 50, maximum 200)")]
     pub limit: Option<usize>,
     #[schemars(description = "Only list chunks whose source_path starts with this prefix.")]
     pub path_prefix: Option<String>,
@@ -187,7 +190,7 @@ impl ContextService {
             tag,
         }): Parameters<SearchRequest>,
     ) -> String {
-        let limit = limit.unwrap_or(5);
+        let limit = limit.unwrap_or(5).clamp(1, MAX_SEARCH_RESULTS);
         if query.trim().is_empty() {
             return "error: query is required".into();
         }
@@ -214,7 +217,7 @@ impl ContextService {
         &self,
         Parameters(ListRequest { limit, path_prefix }): Parameters<ListRequest>,
     ) -> String {
-        let limit = limit.unwrap_or(50);
+        let limit = limit.unwrap_or(50).clamp(1, MAX_LIST_RESULTS);
         self.refresh();
         let db = match self.db.lock() {
             Ok(d) => d,
