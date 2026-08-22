@@ -85,13 +85,19 @@ fn db_stamp_for(path: &Path) -> Option<DbStamp> {
     })
 }
 
+/// Default MCP instructions shown to the agent when the corpus was indexed
+/// without an explicit `--instructions`. Kept measured so the agent only
+/// searches when the question plausibly touches the knowledge base, instead of
+/// over-firing on unrelated questions. Users who want the strongly-worded
+/// "always search, never guess" guidance can set it explicitly via
+/// `index --instructions` (stored in DB meta).
 const DEFAULT_INSTRUCTIONS: &str =
-    "Organizational markdown knowledge base (teams, people, ownership, processes, guides). \
-ALWAYS call semantic_search before answering questions about \
-who owns what, team structure, managers, acronyms, backports, or internal process — \
-do not guess from general knowledge. Use list_documents to browse the corpus. \
-Cite passages as source_path#chunk_index and call get_document to fetch a full chunk by that citation. \
-Use path_prefix/heading/tag filters to scope search (e.g. path_prefix='teams/').";
+    "This server searches an indexed markdown knowledge base (teams, people, \
+ownership, processes, guides). If a question may be answerable from this \
+corpus, call semantic_search rather than relying only on general knowledge. \
+Use list_documents to browse what is indexed, and cite passages as \
+source_path#chunk_index (fetch full text via get_document). For unrelated \
+general questions, answer normally without forcing a search.";
 
 impl ContextService {
     pub fn new(db: Db, index: Index, embedder: Embedder, db_path: PathBuf) -> Self {
