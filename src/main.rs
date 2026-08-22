@@ -115,6 +115,10 @@ enum Commands {
         #[arg(long, default_value = "context.db")]
         db: String,
     },
+    /// Show embedding model cache status
+    ModelStatus,
+    /// Download and initialize the embedding model cache
+    ModelDownload,
 }
 
 fn main() -> Result<()> {
@@ -161,6 +165,8 @@ fn main() -> Result<()> {
         Commands::Eval { db, cases, limit } => run_eval(db, cases, limit),
         Commands::Status { db, json } => run_status(db, json),
         Commands::Validate { db } => run_validate(db),
+        Commands::ModelStatus => run_model_status(),
+        Commands::ModelDownload => run_model_download(),
     }
 }
 
@@ -557,6 +563,27 @@ fn run_validate(db_spec: String) -> Result<()> {
         bail!("SQLite integrity_check failed: {result}");
     }
     println!("ok: {}", db.summary()?);
+    Ok(())
+}
+
+fn run_model_status() -> Result<()> {
+    let path = embed::model_cache_dir()?;
+    println!(
+        "model={} cached={} path={}",
+        embed::MODEL_ID,
+        embed::model_is_cached()?,
+        path.display()
+    );
+    Ok(())
+}
+
+fn run_model_download() -> Result<()> {
+    let _ = embed::Embedder::new()?;
+    println!(
+        "model={} ready at {}",
+        embed::MODEL_ID,
+        embed::model_cache_dir()?.display()
+    );
     Ok(())
 }
 
