@@ -11,6 +11,9 @@ pub const DIM: usize = 384;
 /// BGE retrieval instruction: prefix queries only; passages are embedded as-is.
 /// See https://huggingface.co/BAAI/bge-small-en-v1.5
 const QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
+/// Persisted provenance for every behavior that affects vector compatibility.
+pub const EMBEDDING_FINGERPRINT: &str =
+    "v1|fastembed:BGESmallENV15|dim:384|pool:model-default|l2:true|query:bge-v1.5";
 
 pub struct Embedder {
     model: TextEmbedding,
