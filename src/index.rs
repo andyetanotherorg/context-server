@@ -174,18 +174,42 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
             let title = caps[2].trim().to_string();
             match level {
                 1 => {
-                    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path, &metadata);
+                    emit(
+                        &mut body,
+                        &doc_title,
+                        &h2,
+                        &h3,
+                        &mut chunks,
+                        source_path,
+                        &metadata,
+                    );
                     doc_title = title;
                     h2.clear();
                     h3.clear();
                 }
                 2 => {
-                    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path, &metadata);
+                    emit(
+                        &mut body,
+                        &doc_title,
+                        &h2,
+                        &h3,
+                        &mut chunks,
+                        source_path,
+                        &metadata,
+                    );
                     h2 = title;
                     h3.clear();
                 }
                 3 => {
-                    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path, &metadata);
+                    emit(
+                        &mut body,
+                        &doc_title,
+                        &h2,
+                        &h3,
+                        &mut chunks,
+                        source_path,
+                        &metadata,
+                    );
                     h3 = title;
                 }
                 _ => body.push(line.to_string()),
@@ -194,7 +218,15 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
         }
         body.push(line.to_string());
     }
-    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path, &metadata);
+    emit(
+        &mut body,
+        &doc_title,
+        &h2,
+        &h3,
+        &mut chunks,
+        source_path,
+        &metadata,
+    );
     split_oversized(chunks)
 }
 
@@ -296,7 +328,10 @@ fn parse_front_matter(content: &str) -> (serde_json::Map<String, serde_json::Val
             }
 
             if let Some(key) = current_list_key.take() {
-                meta.insert(key, serde_json::Value::Array(std::mem::take(&mut list_items)));
+                meta.insert(
+                    key,
+                    serde_json::Value::Array(std::mem::take(&mut list_items)),
+                );
             }
 
             if let Some((k, v)) = line.split_once(':') {
@@ -311,7 +346,11 @@ fn parse_front_matter(content: &str) -> (serde_json::Map<String, serde_json::Val
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|s| serde_json::Value::String(s.trim_matches('"').trim_matches('\'').to_string()))
+                        .map(|s| {
+                            serde_json::Value::String(
+                                s.trim_matches('"').trim_matches('\'').to_string(),
+                            )
+                        })
                         .collect();
                     meta.insert(k, serde_json::Value::Array(items));
                 } else {
@@ -480,10 +519,7 @@ Body content here.
         let chunks = split_markdown("test.md", md);
         assert_eq!(chunks.len(), 1);
         let tags = chunks[0].metadata.get("tags").expect("tags present");
-        assert_eq!(
-            tags,
-            &serde_json::json!(["backend", "storage"])
-        );
+        assert_eq!(tags, &serde_json::json!(["backend", "storage"]));
         assert_eq!(
             chunks[0].metadata.get("category"),
             Some(&serde_json::json!("guides"))
