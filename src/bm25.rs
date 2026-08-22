@@ -87,20 +87,29 @@ pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            cur.push(ch.to_ascii_lowercase());
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            cur.extend(ch.to_lowercase());
         } else if !cur.is_empty() {
-            if cur.len() >= 2 {
-                tokens.push(std::mem::take(&mut cur));
-            } else {
-                cur.clear();
-            }
+            push_token_and_components(&mut tokens, std::mem::take(&mut cur));
         }
     }
-    if cur.len() >= 2 {
-        tokens.push(cur);
-    }
+    push_token_and_components(&mut tokens, cur);
     tokens
+}
+
+fn push_token_and_components(tokens: &mut Vec<String>, token: String) {
+    if token.chars().count() < 2 {
+        return;
+    }
+    tokens.push(token.clone());
+    if token.contains(['-', '_']) {
+        tokens.extend(
+            token
+                .split(['-', '_'])
+                .filter(|part| part.chars().count() >= 2)
+                .map(str::to_string),
+        );
+    }
 }
 
 fn unique_terms(terms: &[String]) -> Vec<&String> {
@@ -155,5 +164,25 @@ mod tests {
         let lex = vec![2usize, 0, 1];
         let fused = reciprocal_rank_fusion(&[dense, lex], 60.0);
         assert_eq!(fused[0].0, 0); // appears high in both
+    }
+
+    #[test]
+    fn tokenizes_unicode_and_identifier_components() {
+        let tokens = tokenize("Café foo-bar storage_team 深い");
+        for expected in [
+            "café",
+            "foo-bar",
+            "foo",
+            "bar",
+            "storage_team",
+            "storage",
+            "team",
+            "深い",
+        ] {
+            assert!(
+                tokens.contains(&expected.to_string()),
+                "missing {expected}: {tokens:?}"
+            );
+        }
     }
 }
