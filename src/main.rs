@@ -103,6 +103,18 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         limit: usize,
     },
+    /// Show corpus and index metadata
+    Status {
+        #[arg(long, default_value = "context.db")]
+        db: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate database integrity and model compatibility
+    Validate {
+        #[arg(long, default_value = "context.db")]
+        db: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -147,6 +159,8 @@ fn main() -> Result<()> {
         Commands::Get { db, path, chunk } => run_get(db, path, chunk),
         Commands::Embed { text } => run_embed(text),
         Commands::Eval { db, cases, limit } => run_eval(db, cases, limit),
+        Commands::Status { db, json } => run_status(db, json),
+        Commands::Validate { db } => run_validate(db),
     }
 }
 
@@ -511,6 +525,38 @@ fn run_eval(db_spec: String, cases_path: PathBuf, limit: usize) -> Result<()> {
         "cases={} recall@{}={:.4} mrr={:.4}",
         metrics.cases, limit, metrics.recall_at_k, metrics.mrr
     );
+    Ok(())
+}
+
+fn run_status(db_spec: String, json: bool) -> Result<()> {
+    let path = remote::resolve_db_blocking(&db_spec)?;
+    let db = store::Db::open(&path)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path, "chunks": db.count()?, "files": db.source_paths()?.len(),
+                "model_id": db.get_meta("model_id")?, "chunker_version": db.get_meta("chunker_version")?,
+                "embedding_fingerprint": db.get_meta("embedding_fingerprint")?,
+            })
+        );
+    } else {
+        println!("{}", db.summary()?);
+    }
+    Ok(())
+}
+
+fn run_validate(db_spec: String) -> Result<()> {
+    let path = remote::resolve_db_blocking(&db_spec)?;
+    let db = store::Db::open(&path)?;
+    db.ensure_model_compatible()?;
+    let result: String = db
+        .conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if result != "ok" {
+        bail!("SQLite integrity_check failed: {result}");
+    }
+    println!("ok: {}", db.summary()?);
     Ok(())
 }
 
