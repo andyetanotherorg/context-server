@@ -173,6 +173,10 @@ CREATE TABLE IF NOT EXISTS files (
             Some(v) if v == CHUNKER_VERSION => {}
             _ => return Ok(true),
         }
+        match self.get_meta("embedding_fingerprint")? {
+            Some(v) if v == embed::EMBEDDING_FINGERPRINT => {}
+            _ => return Ok(true),
+        }
         if self.file_hashes()?.is_empty() {
             return Ok(true);
         }
@@ -216,39 +220,29 @@ CREATE TABLE IF NOT EXISTS files (
 
     /// Ensure DB embeddings were built with the current model.
     pub fn ensure_model_compatible(&self) -> Result<()> {
-        let model = self.get_meta("model_id")?;
-        let dim = self.get_meta("dim")?;
-
-        match (model.as_deref(), dim.as_deref()) {
-            (None, _) | (_, None) => {
-                // Legacy DBs from before meta existed — verify dim from first embedding.
-                let mut stmt = self.conn.prepare("SELECT dim FROM embeddings LIMIT 1")?;
-                let mut rows = stmt.query([])?;
-                if let Some(row) = rows.next()? {
-                    let d: i64 = row.get(0)?;
-                    if d as usize != embed::DIM {
-                        bail!(
-                            "database embedding dim {d} != {MODEL_ID} dim {}; re-run index",
-                            embed::DIM
-                        );
-                    }
-                }
-                Ok(())
-            }
-            (Some(m), Some(d)) => {
-                if m != MODEL_ID {
-                    bail!("database model {m:?} != current {MODEL_ID:?}; re-run index");
-                }
-                let d: usize = d.parse().context("parse meta.dim")?;
-                if d != embed::DIM {
-                    bail!(
-                        "database dim {d} != {MODEL_ID} dim {}; re-run index",
-                        embed::DIM
-                    );
-                }
-                Ok(())
-            }
+        let fingerprint = self
+            .get_meta("embedding_fingerprint")?
+            .context("database has no embedding_fingerprint; re-run index")?;
+        if fingerprint != embed::EMBEDDING_FINGERPRINT {
+            bail!("database embedding_fingerprint is incompatible; re-run index");
         }
+        let model = self
+            .get_meta("model_id")?
+            .context("database has no model_id; re-run index")?;
+        if model != MODEL_ID {
+            bail!("database model {model:?} != current {MODEL_ID:?}; re-run index");
+        }
+        let dim = self
+            .get_meta("dim")?
+            .context("database has no dim; re-run index")?;
+        let dim: usize = dim.parse().context("parse meta.dim")?;
+        if dim != embed::DIM {
+            bail!(
+                "database dim {dim} != {MODEL_ID} dim {}; re-run index",
+                embed::DIM
+            );
+        }
+        Ok(())
     }
 
     pub fn count(&self) -> Result<usize> {
@@ -450,6 +444,7 @@ fn write_index_meta(tx: &Transaction<'_>, instructions: Option<&str>) -> Result<
     upsert_meta(tx, "model_id", MODEL_ID)?;
     upsert_meta(tx, "dim", &embed::DIM.to_string())?;
     upsert_meta(tx, "chunker_version", CHUNKER_VERSION)?;
+    upsert_meta(tx, "embedding_fingerprint", embed::EMBEDDING_FINGERPRINT)?;
     if let Some(text) = instructions {
         upsert_meta(tx, "instructions", text)?;
     }
@@ -608,6 +603,38 @@ mod tests {
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes.get("a.md").unwrap(), &hash);
         assert!(!hashes.contains_key("b.md"));
+    }
+
+    #[test]
+    fn missing_embedding_fingerprint_requires_reembed_and_blocks_search() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut db = Db::open(&path).unwrap();
+        let chunks = vec![chunk("a.md", "hello")];
+        db.replace_all(&chunks, &[dummy_vec()], None).unwrap();
+        db.conn
+            .execute("DELETE FROM meta WHERE key = 'embedding_fingerprint'", [])
+            .unwrap();
+
+        assert!(db.needs_full_reembed().unwrap());
+        let err = db
+            .ensure_model_compatible()
+            .expect_err("ambiguous provenance must block search");
+        assert!(err.to_string().contains("embedding_fingerprint"), "{err:#}");
+    }
+
+    #[test]
+    fn mismatched_embedding_fingerprint_requires_reembed_and_blocks_search() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut db = Db::open(&path).unwrap();
+        let chunks = vec![chunk("a.md", "hello")];
+        db.replace_all(&chunks, &[dummy_vec()], None).unwrap();
+        db.set_meta("embedding_fingerprint", "different-model-config")
+            .unwrap();
+
+        assert!(db.needs_full_reembed().unwrap());
+        assert!(db.ensure_model_compatible().is_err());
     }
 
     #[test]
