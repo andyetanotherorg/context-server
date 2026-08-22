@@ -252,13 +252,18 @@ CREATE TABLE IF NOT EXISTS files (
         Ok(n as usize)
     }
 
-    pub fn list(&self, limit: usize, path_prefix: Option<&str>) -> Result<Vec<Document>> {
+    pub fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<Document>> {
         let prefix = path_prefix.unwrap_or("").trim();
         let rows = if prefix.is_empty() {
             let mut stmt = self.conn.prepare(
-                "SELECT id, source_path, chunk_index, text, headings, metadata FROM documents ORDER BY source_path, chunk_index LIMIT ?1",
+                "SELECT id, source_path, chunk_index, text, headings, metadata FROM documents ORDER BY source_path, chunk_index LIMIT ?1 OFFSET ?2",
             )?;
-            let mapped = stmt.query_map(params![limit as i64], |row| {
+            let mapped = stmt.query_map(params![limit as i64, offset as i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -278,9 +283,9 @@ CREATE TABLE IF NOT EXISTS files (
                     .replace('_', "\\_")
             );
             let mut stmt = self.conn.prepare(
-                "SELECT id, source_path, chunk_index, text, headings, metadata FROM documents WHERE source_path LIKE ?1 ESCAPE '\\' ORDER BY source_path, chunk_index LIMIT ?2",
+                "SELECT id, source_path, chunk_index, text, headings, metadata FROM documents WHERE source_path LIKE ?1 ESCAPE '\\' ORDER BY source_path, chunk_index LIMIT ?2 OFFSET ?3",
             )?;
-            let mapped = stmt.query_map(params![escaped, limit as i64], |row| {
+            let mapped = stmt.query_map(params![escaped, limit as i64, offset as i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -672,15 +677,15 @@ mod tests {
         let vectors = vec![dummy_vec(), dummy_vec(), dummy_vec()];
         db.replace_all(&chunks, &vectors, None).unwrap();
 
-        let all = db.list(10, None).unwrap();
+        let all = db.list_page(10, 0, None).unwrap();
         assert_eq!(all.len(), 3);
 
-        let teams = db.list(10, Some("teams/")).unwrap();
+        let teams = db.list_page(10, 0, Some("teams/")).unwrap();
         assert_eq!(teams.len(), 2);
         assert_eq!(teams[0].source_path, "teams/eng.md");
         assert_eq!(teams[1].source_path, "teams/storage.md");
 
-        let limited = db.list(1, Some("teams/")).unwrap();
+        let limited = db.list_page(1, 0, Some("teams/")).unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].source_path, "teams/eng.md");
     }

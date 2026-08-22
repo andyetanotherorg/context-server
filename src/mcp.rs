@@ -42,6 +42,8 @@ pub struct ListRequest {
     pub limit: Option<usize>,
     #[schemars(description = "Only list chunks whose source_path starts with this prefix.")]
     pub path_prefix: Option<String>,
+    #[schemars(description = "Zero-based chunk offset for pagination")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -215,7 +217,11 @@ impl ContextService {
     )]
     fn list_documents(
         &self,
-        Parameters(ListRequest { limit, path_prefix }): Parameters<ListRequest>,
+        Parameters(ListRequest {
+            limit,
+            path_prefix,
+            offset,
+        }): Parameters<ListRequest>,
     ) -> String {
         let limit = limit.unwrap_or(50).clamp(1, MAX_LIST_RESULTS);
         self.refresh();
@@ -223,7 +229,7 @@ impl ContextService {
             Ok(d) => d,
             Err(_) => return "error: database lock poisoned; restart the server".into(),
         };
-        match db.list(limit, path_prefix.as_deref()) {
+        match db.list_page(limit, offset.unwrap_or(0), path_prefix.as_deref()) {
             Ok(filtered) => {
                 let mut out = format!("Showing {} document chunks:\n", filtered.len());
                 for d in filtered {
