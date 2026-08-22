@@ -416,25 +416,25 @@ pub fn collect(root: &Path) -> Result<Vec<Chunk>> {
         return Ok(chunks);
     }
 
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
         if entry.file_type().is_dir() {
             let name = entry.file_name().to_string_lossy();
-            if name == ".git" || name == "node_modules" || name == "vendor" || name == "target" {
-                // WalkDir doesn't skip easily mid-walk without filter_entry; fine to skip files only
-            }
+            !matches!(
+                name.as_ref(),
+                ".git" | "node_modules" | "vendor" | "target" | ".target" | ".venv"
+            )
+        } else {
+            true
+        }
+    });
+
+    for entry in walker {
+        let entry = entry.with_context(|| format!("walk directory {}", root.display()))?;
+        if entry.file_type().is_dir() {
             continue;
         }
         let path = entry.path();
         if !is_markdown(path) {
-            continue;
-        }
-        // Skip under ignored dirs
-        if path.components().any(|c| {
-            matches!(
-                c.as_os_str().to_str(),
-                Some(".git" | "node_modules" | "vendor" | "target")
-            )
-        }) {
             continue;
         }
         let rel = path
