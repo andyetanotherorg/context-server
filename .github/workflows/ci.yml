@@ -34,8 +34,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -50,9 +48,10 @@ jobs:
   # remains for local podman/docker wheel builds.
   linux:
     name: Linux wheel (${{ matrix.arch }})
+    needs: [test]
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - os: ubuntu-24.04
@@ -122,6 +121,7 @@ jobs:
 
   macos:
     name: macOS wheel (aarch64)
+    needs: [test]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
