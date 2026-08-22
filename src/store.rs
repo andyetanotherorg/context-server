@@ -444,6 +444,17 @@ fn write_index_meta(tx: &Transaction<'_>, instructions: Option<&str>) -> Result<
     upsert_meta(tx, "model_id", MODEL_ID)?;
     upsert_meta(tx, "dim", &embed::DIM.to_string())?;
     upsert_meta(tx, "chunker_version", CHUNKER_VERSION)?;
+    let generation: i64 = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'generation'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+        + 1;
+    upsert_meta(tx, "generation", &generation.to_string())?;
     upsert_meta(tx, "embedding_fingerprint", embed::EMBEDDING_FINGERPRINT)?;
     if let Some(text) = instructions {
         upsert_meta(tx, "instructions", text)?;
