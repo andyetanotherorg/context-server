@@ -210,6 +210,7 @@ fn run_index(
 
     let mut db = store::Db::open(&db_path)?;
     let force_full = full || db.needs_full_reembed()?;
+    validate_index_mode(update, force_full)?;
     let mut existing = db.file_hashes()?;
     for path in db.source_paths()? {
         existing.entry(path).or_default();
@@ -306,6 +307,16 @@ fn run_index(
         );
     }
     println!("wrote {}", db.summary()?);
+    Ok(())
+}
+
+fn validate_index_mode(update: bool, force_full: bool) -> Result<()> {
+    if update && force_full {
+        bail!(
+            "--update cannot be used while a full model/chunker migration is required; \
+             re-index the complete corpus without --update"
+        );
+    }
     Ok(())
 }
 
@@ -460,4 +471,33 @@ fn run_embed(text: Vec<String>) -> Result<()> {
         embed::cosine(&vecs[0], &vecs[2])
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_update_is_rejected_when_index_migration_is_required() {
+        let err = validate_index_mode(true, true).expect_err("partial migration must fail");
+        assert!(
+            err.to_string().contains("--update"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn partial_update_is_allowed_when_index_is_compatible() {
+        validate_index_mode(true, false).expect("compatible partial update");
+    }
+
+    #[test]
+    fn full_sync_is_allowed_when_index_migration_is_required() {
+        validate_index_mode(false, true).expect("complete migration");
+    }
+
+    #[test]
+    fn compatible_full_sync_is_allowed() {
+        validate_index_mode(false, false).expect("compatible full sync");
+    }
 }
