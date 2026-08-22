@@ -148,7 +148,7 @@ fn try_reload(path: &Path, last: &mut Option<DbStamp>) -> Option<(Db, Index, Str
     if *last == Some(current) {
         return None;
     }
-    let new_db = Db::open(path).ok()?;
+    let new_db = Db::open_read_only(path).ok()?;
     let new_index = Index::load(&new_db).ok()?;
     let instructions = new_db
         .get_meta("instructions")
@@ -156,7 +156,9 @@ fn try_reload(path: &Path, last: &mut Option<DbStamp>) -> Option<(Db, Index, Str
         .flatten()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
-    *last = Some(current);
+    // Opening/reading a WAL database can update filesystem bookkeeping. Record
+    // the post-load stamp so the next tool call does not immediately reload it.
+    *last = db_stamp_for(path).or(Some(current));
     Some((new_db, new_index, instructions))
 }
 

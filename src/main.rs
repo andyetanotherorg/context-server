@@ -340,7 +340,7 @@ async fn run_serve(db_spec: String) -> Result<()> {
         .init();
 
     let db_path = remote::resolve_db(&db_spec).await?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let n = db.count()?;
     if n == 0 {
         bail!(
@@ -385,7 +385,7 @@ fn run_search(
         tag,
     };
     let db_path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let idx = search::Index::load(&db)?;
     if idx.is_empty() {
         bail!("database {} has no documents", db_path.display());
@@ -411,7 +411,7 @@ fn run_search(
 
 fn run_get(db_spec: String, path: String, chunk: Option<usize>) -> Result<()> {
     let db_path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let idx = search::Index::load(&db)?;
     match chunk {
         Some(i) => {

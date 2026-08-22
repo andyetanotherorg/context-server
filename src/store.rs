@@ -3,7 +3,7 @@
 use crate::embed::{self, MODEL_ID};
 use crate::index::{Chunk, CHUNKER_VERSION};
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -31,8 +31,11 @@ pub struct Db {
     pub(crate) conn: Connection,
 }
 
+const SCHEMA_VERSION: &str = "1";
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        let existed = path.exists();
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         // `serve` and `index` may share the same WAL DB. Without a busy timeout,
         // a reader hitting a brief writer lock fails immediately with
@@ -71,7 +74,35 @@ CREATE TABLE IF NOT EXISTS files (
 );
 "#,
         )?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        match db.get_meta("schema_version")? {
+            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) => bail!(
+                "database schema_version {version:?} is unsupported (expected {SCHEMA_VERSION})"
+            ),
+            None if existed => {
+                bail!("database has no schema_version; move it aside and re-run index")
+            }
+            None => db.set_meta("schema_version", SCHEMA_VERSION)?,
+        }
+        Ok(db)
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let db = Self { conn };
+        let version = db
+            .get_meta("schema_version")?
+            .context("database has no schema_version; re-run index")?;
+        if version != SCHEMA_VERSION {
+            bail!(
+                "database schema_version {version:?} is unsupported (expected {SCHEMA_VERSION}); re-run index"
+            );
+        }
+        Ok(db)
     }
 
     #[allow(dead_code)]
@@ -619,6 +650,59 @@ mod tests {
         db.replace_all(&chunks, &[dummy_vec()], None).unwrap();
         db.conn.execute("DELETE FROM files", []).unwrap();
         assert!(db.needs_full_reembed().unwrap());
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_missing_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.db");
+
+        assert!(Db::open_read_only(&path).is_err());
+        assert!(
+            !path.exists(),
+            "read-only open must not create the database"
+        );
+    }
+
+    #[test]
+    fn read_only_open_rejects_database_without_schema_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+
+        let err = match Db::open_read_only(&path) {
+            Ok(_) => panic!("legacy schema must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("schema_version"), "{err:#}");
+    }
+
+    #[test]
+    fn writer_records_schema_version_for_readers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("versioned.db");
+        drop(Db::open(&path).unwrap());
+
+        Db::open_read_only(&path).expect("writer-created database is readable");
+    }
+
+    #[test]
+    fn writer_does_not_certify_existing_versionless_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+
+        let err = match Db::open(&path) {
+            Ok(_) => panic!("legacy schema must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("schema_version"), "{err:#}");
     }
 
     #[test]
