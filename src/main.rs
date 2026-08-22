@@ -1,5 +1,6 @@
 mod bm25;
 mod embed;
+mod eval;
 mod index;
 mod mcp;
 mod remote;
@@ -93,6 +94,15 @@ enum Commands {
     },
     /// Embed a search query (smoke test; applies BGE query instruction)
     Embed { text: Vec<String> },
+    /// Evaluate hybrid retrieval against golden citations
+    Eval {
+        #[arg(long, default_value = "context.db")]
+        db: String,
+        #[arg(long, default_value = "eval/cases.json")]
+        cases: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -136,6 +146,7 @@ fn main() -> Result<()> {
         } => run_search(db, limit, mode, path_prefix, heading, tag, query),
         Commands::Get { db, path, chunk } => run_get(db, path, chunk),
         Commands::Embed { text } => run_embed(text),
+        Commands::Eval { db, cases, limit } => run_eval(db, cases, limit),
     }
 }
 
@@ -476,6 +487,29 @@ fn run_embed(text: Vec<String>) -> Result<()> {
     println!(
         "cosine({base:?}, {other:?}) = {:.4}",
         embed::cosine(&vecs[0], &vecs[2])
+    );
+    Ok(())
+}
+
+fn run_eval(db_spec: String, cases_path: PathBuf, limit: usize) -> Result<()> {
+    let db_path = remote::resolve_db_blocking(&db_spec)?;
+    let db = store::Db::open(&db_path)?;
+    let idx = search::Index::load(&db)?;
+    let cases = eval::load_cases(&cases_path)?;
+    let mut emb = embed::Embedder::new()?;
+    let mut values = Vec::with_capacity(cases.len());
+    for case in &cases {
+        let hits = idx.query(&mut emb, &case.query, limit, SearchMode::Hybrid)?;
+        let ranked: Vec<String> = hits
+            .iter()
+            .map(|hit| format!("{}#{}", hit.source_path, hit.chunk_index))
+            .collect();
+        values.push(eval::score_case(&ranked, &case.relevant, limit));
+    }
+    let metrics = eval::aggregate(&values);
+    println!(
+        "cases={} recall@{}={:.4} mrr={:.4}",
+        metrics.cases, limit, metrics.recall_at_k, metrics.mrr
     );
     Ok(())
 }
