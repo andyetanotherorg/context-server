@@ -211,25 +211,16 @@ CREATE TABLE IF NOT EXISTS files (
 
     /// Ensure DB embeddings were built with the current model.
     pub fn ensure_model_compatible(&self) -> Result<()> {
-        let model: Option<String> = self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| {
-                r.get(0)
-            })
-            .ok();
-        let dim: Option<String> = self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = 'dim'", [], |r| r.get(0))
-            .ok();
+        let model = self.get_meta("model_id")?;
+        let dim = self.get_meta("dim")?;
 
         match (model.as_deref(), dim.as_deref()) {
             (None, _) | (_, None) => {
                 // Legacy DBs from before meta existed — verify dim from first embedding.
-                let stored_dim: Option<i64> = self
-                    .conn
-                    .query_row("SELECT dim FROM embeddings LIMIT 1", [], |r| r.get(0))
-                    .ok();
-                if let Some(d) = stored_dim {
+                let mut stmt = self.conn.prepare("SELECT dim FROM embeddings LIMIT 1")?;
+                let mut rows = stmt.query([])?;
+                if let Some(row) = rows.next()? {
+                    let d: i64 = row.get(0)?;
                     if d as usize != embed::DIM {
                         bail!(
                             "database embedding dim {d} != {MODEL_ID} dim {}; re-run index",
