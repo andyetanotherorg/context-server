@@ -136,7 +136,7 @@ Uses [Application Default Credentials](https://cloud.google.com/docs/authenticat
 
 ```text
 context-server index  --input <path> [--db FILE] [--dry-run] [--batch N]
-                      [--full] [--update]
+                      [--full] [--sync]
                       [--instructions TEXT | --instructions-file FILE]
 context-server serve  --db <local path | gs://…>
 context-server search --db <local path | gs://…> [--limit N] [--mode hybrid|dense|lexical]
@@ -144,6 +144,12 @@ context-server search --db <local path | gs://…> [--limit N] [--mode hybrid|de
 context-server get    --db <local path | gs://…> --path FILE [--chunk N]
 context-server embed  <query>         # smoke-test query embedding (BGE instruction)
 ```
+
+`index` is upsert-only by default. Use `--sync` only when the database should
+exactly mirror the current input: it deletes indexed paths missing from that
+input, and an empty input removes every indexed document. The former `--update`
+behavior is now the default; replace previous prune-by-default commands with an
+explicit `--sync`.
 
 ## Build from source
 
@@ -178,7 +184,7 @@ gh workflow run release.yml --repo context-server/context-server
 
 ## Design notes
 
-Under the hood: fastembed BGE-small-en-v1.5 (384-d, L2-normalized; query instruction applied at search time), rusqlite with float32 blobs, [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) over stdio. `index` is incremental by file: unchanged files (same post-chunk content hash) are skipped, so the embedding model is not loaded. Files missing from `--input` are removed. Pass `--full` to re-embed everything collected, or `--update` to upsert without deleting other paths. Re-run `index` after upgrading if `MODEL_ID` or the chunker version changed (that forces a full re-embed).
+Under the hood: fastembed BGE-small-en-v1.5 (384-d, L2-normalized; query instruction applied at search time), rusqlite with float32 blobs, [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) over stdio. `index` is incremental by file: unchanged files (same post-chunk content hash) are skipped, so the embedding model is not loaded. Indexing safely upserts by default. Pass `--sync` to also remove database paths missing from `--input`, or `--full` to re-embed everything collected. A model or chunker migration requires a complete-corpus `--sync` run.
 
 More detail and roadmap: [PLAN.md](PLAN.md).
 
