@@ -8,6 +8,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -53,11 +54,35 @@ pub struct GetDocumentRequest {
 }
 
 pub struct ContextService {
-    pub db: Mutex<Db>,
-    pub index: Index,
-    pub embedder: Mutex<Embedder>,
-    instructions: String,
+    db: Mutex<Db>,
+    index: Mutex<Index>,
+    db_path: PathBuf,
+    db_stamp: Mutex<Option<DbStamp>>,
+    embedder: Mutex<Embedder>,
+    instructions: Mutex<String>,
     tool_router: ToolRouter<Self>,
+}
+
+/// Detects when the on-disk DB (and its WAL) has been rewritten by a separate
+/// `index` process, so `serve` can hot-reload the search index in place instead
+/// of requiring a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DbStamp {
+    mtime: std::time::SystemTime,
+    size: u64,
+    wal_mtime: Option<std::time::SystemTime>,
+    wal_size: u64,
+}
+
+fn db_stamp_for(path: &Path) -> Option<DbStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let wal = std::fs::metadata(format!("{}-wal", path.display())).ok();
+    Some(DbStamp {
+        mtime: meta.modified().ok()?,
+        size: meta.len(),
+        wal_mtime: wal.as_ref().and_then(|m| m.modified().ok()),
+        wal_size: wal.as_ref().map(|m| m.len()).unwrap_or(0),
+    })
 }
 
 const DEFAULT_INSTRUCTIONS: &str =
@@ -69,21 +94,64 @@ Cite passages as source_path#chunk_index and call get_document to fetch a full c
 Use path_prefix/heading/tag filters to scope search (e.g. path_prefix='teams/').";
 
 impl ContextService {
-    pub fn new(db: Db, index: Index, embedder: Embedder) -> Self {
+    pub fn new(db: Db, index: Index, embedder: Embedder, db_path: PathBuf) -> Self {
         let instructions = db
             .get_meta("instructions")
             .ok()
             .flatten()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
+        let db_stamp = db_stamp_for(&db_path);
         Self {
             db: Mutex::new(db),
-            index,
+            index: Mutex::new(index),
+            db_path,
+            db_stamp: Mutex::new(db_stamp),
             embedder: Mutex::new(embedder),
-            instructions,
+            instructions: Mutex::new(instructions),
             tool_router: Self::tool_router(),
         }
     }
+
+    /// If a separate `index` process rewrote the on-disk DB since we last
+    /// loaded, reload the search index (and any MCP `instructions` meta) in
+    /// place. Called at the top of every read tool so long-lived MCP sessions
+    /// stay fresh after a re-index. Errors reloading leave the previous state
+    /// intact (e.g. the DB is mid-write) and are retried next call.
+    fn refresh(&self) {
+        let Some((new_db, new_index, instructions)) =
+            try_reload(&self.db_path, &mut self.db_stamp.lock().unwrap())
+        else {
+            return;
+        };
+        *self.db.lock().unwrap() = new_db;
+        *self.index.lock().unwrap() = new_index;
+        *self.instructions.lock().unwrap() = instructions;
+        eprintln!(
+            "context-server: reloaded index from {}",
+            self.db_path.display()
+        );
+    }
+}
+
+/// Re-open and reload the search index from `path`, but only if the on-disk DB
+/// changed since `last` (which is updated on success). Returns `None` when the
+/// DB is unchanged or cannot be safely read yet (mid-write).
+fn try_reload(path: &Path, last: &mut Option<DbStamp>) -> Option<(Db, Index, String)> {
+    let current = db_stamp_for(path)?;
+    if *last == Some(current) {
+        return None;
+    }
+    let new_db = Db::open(path).ok()?;
+    let new_index = Index::load(&new_db).ok()?;
+    let instructions = new_db
+        .get_meta("instructions")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
+    *last = Some(current);
+    Some((new_db, new_index, instructions))
 }
 
 fn filter_from(
@@ -117,12 +185,17 @@ impl ContextService {
         if query.trim().is_empty() {
             return "error: query is required".into();
         }
+        self.refresh();
         let filter = filter_from(path_prefix, heading, tag);
-        let mut emb = self.embedder.lock().unwrap();
-        match self
-            .index
-            .query_filtered(&mut emb, &query, limit, SearchMode::Hybrid, &filter)
-        {
+        let mut emb = match self.embedder.lock() {
+            Ok(e) => e,
+            Err(_) => return "error: embedder lock poisoned".into(),
+        };
+        let index = match self.index.lock() {
+            Ok(i) => i,
+            Err(_) => return "error: index lock poisoned".into(),
+        };
+        match index.query_filtered(&mut emb, &query, limit, SearchMode::Hybrid, &filter) {
             Ok(hits) => format_hits(&query, &hits),
             Err(e) => format!("error: {e:#}"),
         }
@@ -136,6 +209,7 @@ impl ContextService {
         Parameters(ListRequest { limit, path_prefix }): Parameters<ListRequest>,
     ) -> String {
         let limit = limit.unwrap_or(50);
+        self.refresh();
         let db = self.db.lock().unwrap();
         match db.list(limit, path_prefix.as_deref()) {
             Ok(filtered) => {
@@ -172,13 +246,15 @@ impl ContextService {
         if path.is_empty() {
             return "error: source_path is required".into();
         }
+        self.refresh();
+        let index = self.index.lock().unwrap();
         match chunk_index {
-            Some(idx) => match self.index.get(path, idx) {
+            Some(idx) => match index.get(path, idx) {
                 Some(d) => format_document(d),
                 None => format!("error: no chunk {path}#{idx}"),
             },
             None => {
-                let docs = self.index.get_by_path(path);
+                let docs = index.get_by_path(path);
                 if docs.is_empty() {
                     return format!("error: no chunks for {path}");
                 }
@@ -198,7 +274,7 @@ impl ContextService {
 impl ServerHandler for ContextService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(self.instructions.clone())
+            .with_instructions(self.instructions.lock().unwrap().clone())
     }
 }
 
@@ -240,4 +316,80 @@ fn format_hits(query: &str, hits: &[crate::search::ResultHit]) -> String {
     }
     out.push_str("\nUse get_document with source_path and chunk_index to fetch a full citation.\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed;
+    use crate::index::Chunk;
+    use tempfile::tempdir;
+
+    fn chunk(path: &str, text: &str) -> Chunk {
+        Chunk {
+            source_path: path.into(),
+            chunk_index: 0,
+            text: text.into(),
+            headings: vec![],
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    /// Write the given docs into `path` via a fresh connection (simulates a
+    /// separate `context-server index` process rewriting the on-disk DB).
+    fn rewrite_db(path: &std::path::Path, docs: &[(&str, &str)]) {
+        let mut db = Db::open(path).unwrap();
+        let chunks: Vec<Chunk> = docs.iter().map(|(p, t)| chunk(p, t)).collect();
+        let vectors: Vec<Vec<f32>> = chunks.iter().map(|_| vec![1.0f32; embed::DIM]).collect();
+        db.replace_all(&chunks, &vectors, None).unwrap();
+    }
+
+    #[test]
+    fn db_stamp_changes_when_db_rewritten() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        rewrite_db(&path, &[("a.md", "hello")]);
+
+        let before = db_stamp_for(&path).expect("stamp after first write");
+        rewrite_db(&path, &[("a.md", "hello"), ("b.md", "world")]);
+        let after = db_stamp_for(&path).expect("stamp after rewrite");
+
+        assert!(
+            before != after,
+            "db stamp must change when the DB is rewritten"
+        );
+    }
+
+    #[test]
+    fn try_reload_returns_none_when_unchanged_and_some_after_reindex() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+
+        rewrite_db(&path, &[("a.md", "hello world")]);
+        let mut last = db_stamp_for(&path);
+
+        // Unchanged -> no reload.
+        assert!(
+            try_reload(&path, &mut last).is_none(),
+            "no reload when the DB is unchanged"
+        );
+
+        // Re-index: add a second doc; the stamp now differs -> reload.
+        rewrite_db(&path, &[("a.md", "hello world"), ("b.md", "second doc")]);
+        let (new_db, new_index, _instructions) =
+            try_reload(&path, &mut last).expect("reload after re-index");
+        assert_eq!(new_index.len(), 2, "reloaded index has both docs");
+        assert_eq!(
+            new_index.get_by_path("b.md").len(),
+            1,
+            "new doc present after reload"
+        );
+        drop(new_db);
+
+        // After a successful reload the stamp is recorded -> next call is None.
+        assert!(
+            try_reload(&path, &mut last).is_none(),
+            "subsequent reload skipped once stamp is recorded"
+        );
+    }
 }
