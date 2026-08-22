@@ -150,9 +150,13 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut hierarchy: Vec<String> = Vec::new();
     let mut body_start = 0usize;
+    let mut section_start = 0usize;
     for (level, heading_start, heading_end, title) in headings_found {
         emit_section(
+            &content,
             &content[body_start..heading_start],
+            section_start,
+            heading_start,
             &hierarchy,
             source_path,
             &metadata,
@@ -164,9 +168,13 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
         }
         hierarchy.push(title);
         body_start = heading_end;
+        section_start = heading_start;
     }
     emit_section(
+        &content,
         &content[body_start..],
+        section_start,
+        content.len(),
         &hierarchy,
         source_path,
         &metadata,
@@ -186,8 +194,12 @@ fn heading_level(level: HeadingLevel) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_section(
+    full_content: &str,
     body: &str,
+    section_start: usize,
+    section_end: usize,
     hierarchy: &[String],
     source_path: &str,
     metadata: &serde_json::Map<String, serde_json::Value>,
@@ -207,13 +219,48 @@ fn emit_section(
     } else {
         format!("{}\n\n{}", headings.join(" > "), body)
     };
+    let mut metadata = metadata.clone();
+    metadata.insert(
+        "_chunk_id".into(),
+        serde_json::Value::String(stable_chunk_id(source_path, &headings, body)),
+    );
+    metadata.insert(
+        "_start_line".into(),
+        serde_json::json!(line_at(full_content, section_start)),
+    );
+    metadata.insert(
+        "_end_line".into(),
+        serde_json::json!(line_at(
+            full_content,
+            section_start + full_content[section_start..section_end].trim_end().len()
+        )),
+    );
     chunks.push(Chunk {
         source_path: source_path.to_string(),
         chunk_index: chunks.len(),
         text,
         headings,
-        metadata: metadata.clone(),
+        metadata,
     });
+}
+
+fn stable_chunk_id(source_path: &str, headings: &[String], body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-server-chunk-v1\0");
+    hasher.update(source_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(headings.join("\0").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(body.trim().as_bytes());
+    hex::encode(hasher.finalize())[..16].to_string()
+}
+
+fn line_at(content: &str, byte_offset: usize) -> usize {
+    content.as_bytes()[..byte_offset.min(content.len())]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+        + 1
 }
 
 /// Split any chunk whose embedded text exceeds [`MAX_CHUNK_CHARS`], keeping the
@@ -513,7 +560,7 @@ Text.
     fn malformed_front_matter_is_preserved_as_body() {
         let md = "---\ntags: [unterminated\n---\n# Doc\nBody.\n";
         let chunks = split_markdown("bad.md", md);
-        assert!(chunks[0].metadata.is_empty());
+        assert!(!chunks[0].metadata.contains_key("tags"));
         assert!(chunks[0].text.contains("tags: [unterminated"));
     }
 
@@ -522,10 +569,54 @@ Text.
         let raw = "x".repeat(MAX_FRONT_MATTER_BYTES + 1);
         let md = format!("---\ndescription: {raw}\n---\n# Doc\nBody.\n");
         let chunks = split_markdown("large.md", &md);
-        assert!(chunks[0].metadata.is_empty());
+        assert!(!chunks[0].metadata.contains_key("description"));
         assert!(chunks
             .iter()
             .any(|chunk| chunk.text.contains("description:")));
+    }
+
+    #[test]
+    fn chunk_identity_and_line_ranges_are_stable_when_earlier_sections_change() {
+        let original = "# Doc\n\n## First\n\nAlpha.\n\n## Target\n\nStable body.\n";
+        let edited =
+            "# Doc\n\nIntro added.\n\n## First\n\nAlpha changed.\n\n## Target\n\nStable body.\n";
+        let before = split_markdown("doc.md", original);
+        let after = split_markdown("doc.md", edited);
+        let target_before = before
+            .iter()
+            .find(|c| c.headings.last().is_some_and(|h| h == "Target"))
+            .unwrap();
+        let target_after = after
+            .iter()
+            .find(|c| c.headings.last().is_some_and(|h| h == "Target"))
+            .unwrap();
+        assert_eq!(
+            target_before.metadata["_chunk_id"],
+            target_after.metadata["_chunk_id"]
+        );
+        assert_eq!(
+            (
+                target_before.metadata["_start_line"].as_u64(),
+                target_before.metadata["_end_line"].as_u64()
+            ),
+            (Some(7), Some(9))
+        );
+        assert_eq!(
+            (
+                target_after.metadata["_start_line"].as_u64(),
+                target_after.metadata["_end_line"].as_u64()
+            ),
+            (Some(9), Some(11))
+        );
+    }
+
+    #[test]
+    fn multibyte_heading_offsets_produce_valid_ranges() {
+        let chunks = split_markdown("unicode.md", "# Café ✅\n\nBody.\n\n###### 深い\n\nText.\n");
+        assert_eq!(chunks[0].headings, ["Café ✅"]);
+        assert_eq!(chunks[1].headings, ["Café ✅", "深い"]);
+        assert_eq!(chunks[0].metadata["_start_line"].as_u64(), Some(1));
+        assert_eq!(chunks[0].metadata["_end_line"].as_u64(), Some(3));
     }
 
     #[test]
