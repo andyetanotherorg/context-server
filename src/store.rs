@@ -447,9 +447,10 @@ fn bytes_to_float32(b: &[u8], dim: usize) -> Result<Vec<f32>> {
     if b.len() != dim * 4 {
         bail!("blob length {} != dim*4 ({})", b.len(), dim * 4);
     }
+    let (chunks, _) = b.as_chunks::<4>();
     let mut out = Vec::with_capacity(dim);
-    for chunk in b.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in chunks {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }

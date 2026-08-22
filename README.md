@@ -114,7 +114,6 @@ context-server get --db context.db --path teams/storage.md --chunk 0
 |------|------|
 | `semantic_search` | Ranked passages + scores; optional `path_prefix` / `heading` / `tag` filters |
 | `list_documents` | Indexed chunks; optional `path_prefix` |
-| `answer_question` | Best matching passage(s) — retrieval only; same filters as search |
 | `get_document` | Full chunk by citation (`source_path` + `chunk_index`), or all chunks for a path |
 
 Search hits cite chunks as `source_path#chunk_index`. Call `get_document` to pull the full text for quoting.

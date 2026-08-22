@@ -58,7 +58,6 @@ Only `.md` / `.markdown` files are indexed. Structured sources (team YAML, etc.)
 
 - `semantic_search(query, limit, path_prefix?, heading?, tag?)` — hybrid
 - `list_documents(limit, path_prefix?)`
-- `answer_question(question, limit, path_prefix?, heading?, tag?)` — retrieval only
 - `get_document(source_path, chunk_index?)` — full chunk(s) by citation
 
 ## Status

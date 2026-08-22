@@ -41,22 +41,6 @@ pub struct ListRequest {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct QuestionRequest {
-    #[schemars(
-        description = "Question about people, teams, ownership, processes, or org docs in the knowledge base."
-    )]
-    pub question: String,
-    #[schemars(description = "Candidate passages to consider (default 3)")]
-    pub limit: Option<usize>,
-    #[schemars(description = "Only search under this source_path prefix.")]
-    pub path_prefix: Option<String>,
-    #[schemars(description = "Only search chunks with a matching heading substring.")]
-    pub heading: Option<String>,
-    #[schemars(description = "Only search chunks with this metadata tag.")]
-    pub tag: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentRequest {
     #[schemars(
         description = "Indexed source path as returned in search hits (e.g. 'teams/storage.md')."
@@ -78,7 +62,7 @@ pub struct ContextService {
 
 const DEFAULT_INSTRUCTIONS: &str =
     "Organizational markdown knowledge base (teams, people, ownership, processes, guides). \
-ALWAYS call semantic_search (or answer_question) before answering questions about \
+ALWAYS call semantic_search before answering questions about \
 who owns what, team structure, managers, acronyms, backports, or internal process — \
 do not guess from general knowledge. Use list_documents to browse the corpus. \
 Cite passages as source_path#chunk_index and call get_document to fetch a full chunk by that citation. \
@@ -175,56 +159,6 @@ impl ContextService {
                         "- {}#{} [{}] {}\n",
                         d.source_path, d.chunk_index, heading, preview
                     ));
-                }
-                out
-            }
-            Err(e) => format!("error: {e:#}"),
-        }
-    }
-
-    #[tool(
-        description = "Ask a question against the knowledge base and get the best matching passage. Prefer semantic_search for exploration; use this for a direct 'who/what/how' answer from indexed docs (retrieval only, not generative). Supports the same path_prefix/heading/tag filters as semantic_search."
-    )]
-    fn answer_question(
-        &self,
-        Parameters(QuestionRequest {
-            question,
-            limit,
-            path_prefix,
-            heading,
-            tag,
-        }): Parameters<QuestionRequest>,
-    ) -> String {
-        let limit = limit.unwrap_or(3);
-        if question.trim().is_empty() {
-            return "error: question is required".into();
-        }
-        let filter = filter_from(path_prefix, heading, tag);
-        let mut emb = self.embedder.lock().unwrap();
-        match self
-            .index
-            .query_filtered(&mut emb, &question, limit, SearchMode::Hybrid, &filter)
-        {
-            Ok(hits) if hits.is_empty() => "No relevant passages found.".into(),
-            Ok(hits) => {
-                let top = &hits[0];
-                let mut out = format!(
-                    "Best match (score={:.4}, dense={:.4}, lexical={:.4}) from {}#{}\n\n{}\n",
-                    top.score,
-                    top.dense_score,
-                    top.lexical_score,
-                    top.source_path,
-                    top.chunk_index,
-                    top.text
-                );
-                if hits.len() > 1 {
-                    out.push_str("\n---\nOther candidates:\n");
-                    for h in &hits[1..] {
-                        out.push_str(&format!(
-                            "- score={:.4} {}#{}\n",
-                            h.score, h.source_path, h.chunk_index
-                        ));
-                    }
                 }
                 out
             }
