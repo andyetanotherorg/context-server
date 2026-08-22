@@ -155,6 +155,11 @@ fn read_local_sha256(path: &Path) -> Option<String> {
         .and_then(|t| parse_sha256_text(&t).ok())
 }
 
+/// Verify the bytes that will actually be served, never just a cached sidecar.
+fn cached_database_matches(db_path: &Path, expected: &str) -> bool {
+    db_path.is_file() && sha256_file(db_path).ok().as_deref() == Some(expected)
+}
+
 /// Resolve `--db` to a local filesystem path, downloading from GCS if needed.
 pub async fn resolve_db(spec: &str) -> Result<PathBuf> {
     match parse_db_spec(spec)? {
@@ -226,10 +231,9 @@ async fn fetch_gcs_db(gcs: &GcsRef) -> Result<PathBuf> {
 
     if dest.is_file() {
         if let Some(ref remote) = remote_sum {
-            let local = read_local_sha256(&checksum_path).or_else(|| sha256_file(&dest).ok());
-            if local.as_ref() == Some(remote) {
-                // Refresh local checksum file if we computed it from the DB.
-                if !checksum_path.is_file() {
+            if cached_database_matches(&dest, remote) {
+                // Refresh a missing or stale sidecar after validating the DB bytes.
+                if read_local_sha256(&checksum_path).as_deref() != Some(remote) {
                     let _ = write_sha256_file(&checksum_path, remote, "context.db");
                 }
                 eprintln!(
@@ -457,5 +461,26 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with(&prefix));
+    }
+
+    #[test]
+    fn cached_database_is_validated_even_when_sidecar_matches() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("context.db");
+        let sidecar = dir.path().join("context.db.sha256");
+        fs::write(&db, b"corrupted database").unwrap();
+        write_sha256_file(&sidecar, &"a".repeat(64), "context.db").unwrap();
+
+        assert!(!cached_database_matches(&db, &"a".repeat(64)));
+    }
+
+    #[test]
+    fn cached_database_matches_actual_remote_digest_without_sidecar() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("context.db");
+        fs::write(&db, b"valid database bytes").unwrap();
+        let digest = sha256_file(&db).unwrap();
+
+        assert!(cached_database_matches(&db, &digest));
     }
 }
