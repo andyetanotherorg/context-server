@@ -188,6 +188,14 @@ Under the hood: fastembed BGE-small-en-v1.5 (384-d, L2-normalized; query instruc
 
 More detail and roadmap: [PLAN.md](PLAN.md).
 
+### Supported scale
+
+The primary target is up to 10,000 chunks; 50,000 chunks is the regularly
+benchmarked upper range for the exact in-memory implementation. Re-evaluate
+storage/index architecture around 100,000 chunks or 500 MiB resident memory.
+Run `scripts/benchmark-scale.py --source-db context.db` to reproduce structural
+latency and database-size measurements.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
