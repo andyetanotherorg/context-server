@@ -1,0 +1,6 @@
+[
+  {"query":"how do I reset my password","relevant":["onboarding.md#2"]},
+  {"query":"when is feature freeze","relevant":["release-process.md#0"]},
+  {"query":"previous stable branch critical fixes","relevant":["release-process.md#1"]},
+  {"query":"new hire account setup","relevant":["onboarding.md#1"]}
+]
