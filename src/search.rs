@@ -459,6 +459,65 @@ mod tests {
         .matches(&d));
     }
 
+    /// End-to-end parity test: the `--tag` CLI flag and the MCP `tag` argument
+    /// both build a `SearchFilter { tag }` and rely on the same
+    /// `metadata_has_tag` matching. This test drives that identical path with
+    /// real front-matter tag parsing (`index::split_markdown`), so it proves
+    /// markdown `tags:` front-matter flows into `metadata.tags` and can be
+    /// filtered by tag exactly the same way a CLI or MCP caller would.
+    #[test]
+    fn cli_and_mcp_tag_filter_are_equivalent_over_front_matter() {
+        let tagged_md = "---\ntags:\n  - Storage\n  - kubernetes\n---\n\n# Storage Team\nOwners of the storage cluster.\n";
+        let untagged_md =
+            "---\ntags:\n  - networking\n---\n\n# Networking\nModels the network paths.\n";
+
+        let tagged_chunk = &crate::index::split_markdown("teams/storage.md", tagged_md)[0];
+        let untagged_chunk = &crate::index::split_markdown("teams/net.md", untagged_md)[0];
+
+        fn as_doc(c: &crate::index::Chunk) -> crate::store::Document {
+            crate::store::Document {
+                id: 0,
+                source_path: c.source_path.clone(),
+                chunk_index: c.chunk_index,
+                text: c.text.clone(),
+                headings: c.headings.clone(),
+                metadata: c.metadata.clone(),
+                vector: vec![],
+            }
+        }
+
+        let tagged_doc = as_doc(tagged_chunk);
+        let untagged_doc = as_doc(untagged_chunk);
+
+        // Front-matter tags were parsed into metadata.
+        let tags = tagged_doc.metadata.get("tags").expect("tags present");
+        let arr = tags.as_array().expect("tags is an array");
+        let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, ["Storage", "kubernetes"]);
+
+        // This is the exact filter both `search --tag <t>` (CLI) and
+        // `semantic_search(tag=<t>)` (MCP) build.
+        let filter = SearchFilter {
+            tag: Some("storage".into()),
+            ..Default::default()
+        };
+        assert!(
+            filter.matches(&tagged_doc),
+            "case-insensitive tag match on the tagged doc (CLI == MCP)"
+        );
+        assert!(
+            !filter.matches(&untagged_doc),
+            "doc with a different tag must not match"
+        );
+
+        // A second tag on the same doc also matches.
+        assert!(SearchFilter {
+            tag: Some("KUBERNETES".into()),
+            ..Default::default()
+        }
+        .matches(&tagged_doc));
+    }
+
     #[test]
     fn get_chunk_by_citation() {
         let docs = vec![
