@@ -122,7 +122,7 @@ pub fn plan_index(
 
 /// Split markdown into chunks on ## and ### boundaries.
 pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
-    let content = strip_front_matter(content);
+    let (metadata, content) = parse_front_matter(content);
     let heading_re = Regex::new(r"^(#{1,6})\s+(.+?)\s*$").unwrap();
 
     let mut doc_title = String::new();
@@ -136,7 +136,8 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
                 h2: &str,
                 h3: &str,
                 chunks: &mut Vec<Chunk>,
-                source_path: &str| {
+                source_path: &str,
+                metadata: &serde_json::Map<String, serde_json::Value>| {
         let text = body.join("\n").trim().to_string();
         body.clear();
         if text.is_empty() {
@@ -163,7 +164,7 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
             chunk_index: idx,
             text: prefixed,
             headings,
-            metadata: serde_json::Map::new(),
+            metadata: metadata.clone(),
         });
     };
 
@@ -173,18 +174,42 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
             let title = caps[2].trim().to_string();
             match level {
                 1 => {
-                    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path);
+                    emit(
+                        &mut body,
+                        &doc_title,
+                        &h2,
+                        &h3,
+                        &mut chunks,
+                        source_path,
+                        &metadata,
+                    );
                     doc_title = title;
                     h2.clear();
                     h3.clear();
                 }
                 2 => {
-                    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path);
+                    emit(
+                        &mut body,
+                        &doc_title,
+                        &h2,
+                        &h3,
+                        &mut chunks,
+                        source_path,
+                        &metadata,
+                    );
                     h2 = title;
                     h3.clear();
                 }
                 3 => {
-                    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path);
+                    emit(
+                        &mut body,
+                        &doc_title,
+                        &h2,
+                        &h3,
+                        &mut chunks,
+                        source_path,
+                        &metadata,
+                    );
                     h3 = title;
                 }
                 _ => body.push(line.to_string()),
@@ -193,7 +218,15 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
         }
         body.push(line.to_string());
     }
-    emit(&mut body, &doc_title, &h2, &h3, &mut chunks, source_path);
+    emit(
+        &mut body,
+        &doc_title,
+        &h2,
+        &h3,
+        &mut chunks,
+        source_path,
+        &metadata,
+    );
     split_oversized(chunks)
 }
 
@@ -267,12 +300,74 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
     }
     out
 }
-fn strip_front_matter(content: &str) -> String {
+fn parse_front_matter(content: &str) -> (serde_json::Map<String, serde_json::Value>, String) {
     if !content.starts_with("---") {
-        return content.to_string();
+        return (serde_json::Map::new(), content.to_string());
     }
-    let re = Regex::new(r"(?s)^---\r?\n.*?\r?\n---\r?\n?").unwrap();
-    re.replace(content, "").into_owned()
+    let re = Regex::new(r"(?s)^---\r?\n(.*?)\r?\n---\r?\n?").unwrap();
+    if let Some(caps) = re.captures(content) {
+        let raw_yaml = &caps[1];
+        let remaining = &content[caps[0].len()..];
+        let mut meta = serde_json::Map::new();
+
+        let mut current_list_key: Option<String> = None;
+        let mut list_items: Vec<serde_json::Value> = Vec::new();
+
+        for line in raw_yaml.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if let Some(item_raw) = trimmed.strip_prefix("- ") {
+                if let Some(ref _key) = current_list_key {
+                    let item = item_raw.trim().trim_matches('"').trim_matches('\'');
+                    list_items.push(serde_json::Value::String(item.to_string()));
+                    continue;
+                }
+            }
+
+            if let Some(key) = current_list_key.take() {
+                meta.insert(
+                    key,
+                    serde_json::Value::Array(std::mem::take(&mut list_items)),
+                );
+            }
+
+            if let Some((k, v)) = line.split_once(':') {
+                let k = k.trim().to_string();
+                let v = v.trim();
+                if v.is_empty() {
+                    current_list_key = Some(k);
+                    list_items.clear();
+                } else if (v.starts_with('[') && v.ends_with(']')) || v.contains(',') {
+                    let inner = v.trim_matches(|c| c == '[' || c == ']');
+                    let items: Vec<serde_json::Value> = inner
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            serde_json::Value::String(
+                                s.trim_matches('"').trim_matches('\'').to_string(),
+                            )
+                        })
+                        .collect();
+                    meta.insert(k, serde_json::Value::Array(items));
+                } else {
+                    let scalar = v.trim_matches('"').trim_matches('\'');
+                    meta.insert(k, serde_json::Value::String(scalar.to_string()));
+                }
+            }
+        }
+
+        if let Some(key) = current_list_key.take() {
+            meta.insert(key, serde_json::Value::Array(list_items));
+        }
+
+        (meta, remaining.to_string())
+    } else {
+        (serde_json::Map::new(), content.to_string())
+    }
 }
 
 pub fn heading_path(c: &Chunk) -> String {
@@ -405,6 +500,45 @@ Upstream repos use stable branches.
             chunks[2].headings,
             ["Backport Process", "Requirements by Bug Status", "NEW"]
         );
+    }
+
+    #[test]
+    fn front_matter_tags_extracted_to_metadata() {
+        let md = r#"---
+title: Test Document
+tags:
+  - backend
+  - "storage"
+category: guides
+---
+
+# Guide
+
+Body content here.
+"#;
+        let chunks = split_markdown("test.md", md);
+        assert_eq!(chunks.len(), 1);
+        let tags = chunks[0].metadata.get("tags").expect("tags present");
+        assert_eq!(tags, &serde_json::json!(["backend", "storage"]));
+        assert_eq!(
+            chunks[0].metadata.get("category"),
+            Some(&serde_json::json!("guides"))
+        );
+    }
+
+    #[test]
+    fn front_matter_inline_array_tags() {
+        let md = r#"---
+tags: [devops, infra, kubevirt]
+---
+
+# Title
+Text.
+"#;
+        let chunks = split_markdown("x.md", md);
+        assert_eq!(chunks.len(), 1);
+        let tags = chunks[0].metadata.get("tags").unwrap();
+        assert_eq!(tags, &serde_json::json!(["devops", "infra", "kubevirt"]));
     }
 
     #[test]
