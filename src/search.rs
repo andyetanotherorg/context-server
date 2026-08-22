@@ -42,6 +42,7 @@ pub struct ResultHit {
     pub source_path: String,
     pub chunk_index: usize,
     pub headings: Vec<String>,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
     pub text: String,
 }
 
@@ -143,6 +144,16 @@ impl Index {
         self.docs
             .iter()
             .find(|d| d.source_path == source_path && d.chunk_index == chunk_index)
+    }
+
+    pub fn get_by_chunk_id(&self, chunk_id: &str) -> Option<&Document> {
+        self.docs.iter().find(|document| {
+            document
+                .metadata
+                .get("_chunk_id")
+                .and_then(|value| value.as_str())
+                == Some(chunk_id)
+        })
     }
 
     /// All chunks for a source path, ordered by `chunk_index`.
@@ -339,6 +350,7 @@ fn hit_from(
         source_path: d.source_path.clone(),
         chunk_index: d.chunk_index,
         headings: d.headings.clone(),
+        metadata: d.metadata.clone(),
         text: d.text.clone(),
     }
 }

@@ -712,7 +712,7 @@ The findings in this assessment are addressed by the following verified changes:
 - GCS cache integrity: cached database bytes are hashed directly.
 - Index semantics: safe upsert default, explicit destructive synchronization.
 - Empty corpus: explicit empty synchronization prunes stale rows.
-- Database access: read-only readers and explicit schema compatibility.
+- Database access: read-only serve/search/get/hot-reload readers and explicit schema compatibility.
 - Embedding provenance: versioned, fail-closed fingerprint.
 - Markdown/YAML ingestion: structural Markdown parser and bounded real YAML decoding.
 - Citations: source-namespaced stable IDs and source line ranges.

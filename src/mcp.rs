@@ -58,6 +58,12 @@ pub struct GetDocumentRequest {
     pub chunk_index: Option<usize>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetChunkByIdRequest {
+    #[schemars(description = "Stable chunk ID returned in chunk metadata")]
+    pub chunk_id: String,
+}
+
 pub struct ContextService {
     db: Mutex<Db>,
     index: Mutex<Index>,
@@ -71,15 +77,31 @@ pub struct ContextService {
 /// Detects when the on-disk DB (and its WAL) has been rewritten by a separate
 /// `index` process, so `serve` can hot-reload the search index in place instead
 /// of requiring a restart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DbStamp {
     mtime: std::time::SystemTime,
     size: u64,
     wal_mtime: Option<std::time::SystemTime>,
     wal_size: u64,
+    generation: Option<String>,
+    file_id: u64,
+}
+
+fn generation_for(path: &Path) -> Option<String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'generation'",
+        [],
+        |row| row.get(0),
+    )
+    .ok()
 }
 
 fn db_stamp_for(path: &Path) -> Option<DbStamp> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
     let wal = std::fs::metadata(format!("{}-wal", path.display())).ok();
     Some(DbStamp {
@@ -87,6 +109,11 @@ fn db_stamp_for(path: &Path) -> Option<DbStamp> {
         size: meta.len(),
         wal_mtime: wal.as_ref().and_then(|m| m.modified().ok()),
         wal_size: wal.as_ref().map(|m| m.len()).unwrap_or(0),
+        generation: generation_for(path),
+        #[cfg(unix)]
+        file_id: meta.ino(),
+        #[cfg(not(unix))]
+        file_id: 0,
     })
 }
 
@@ -150,10 +177,15 @@ impl ContextService {
 /// DB is unchanged or cannot be safely read yet (mid-write).
 fn try_reload(path: &Path, last: &mut Option<DbStamp>) -> Option<(Db, Index, String)> {
     let current = db_stamp_for(path)?;
-    if *last == Some(current) {
+    if last.as_ref().is_some_and(|previous| {
+        previous == &current
+            || previous.file_id == current.file_id
+                && previous.generation.is_some()
+                && previous.generation == current.generation
+    }) {
         return None;
     }
-    let new_db = Db::open(path).ok()?;
+    let new_db = Db::open_read_only(path).ok()?;
     let new_index = Index::load(&new_db).ok()?;
     let instructions = new_db
         .get_meta("instructions")
@@ -161,7 +193,14 @@ fn try_reload(path: &Path, last: &mut Option<DbStamp>) -> Option<(Db, Index, Str
         .flatten()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
-    *last = Some(current);
+    let after = db_stamp_for(path)?;
+    if after.file_id != current.file_id || after.generation != current.generation {
+        // The committed database changed while the snapshot was loading. Keep
+        // serving the prior snapshot and retry on the next tool call. WAL
+        // timestamps may move during a read, so identity is inode+generation.
+        return None;
+    }
+    *last = Some(after);
     Some((new_db, new_index, instructions))
 }
 
@@ -250,6 +289,22 @@ impl ContextService {
         }
     }
 
+    #[tool(description = "Fetch a full chunk by stable chunk ID.")]
+    fn get_chunk_by_id(
+        &self,
+        Parameters(GetChunkByIdRequest { chunk_id }): Parameters<GetChunkByIdRequest>,
+    ) -> String {
+        self.refresh();
+        let index = match self.index.lock() {
+            Ok(index) => index,
+            Err(_) => return "error: index lock poisoned; restart the server".into(),
+        };
+        match index.get_by_chunk_id(chunk_id.trim()) {
+            Some(document) => format_document(document),
+            None => format!("error: no chunk with id {}", chunk_id.trim()),
+        }
+    }
+
     #[tool(
         description = "Fetch a full indexed chunk by citation for quoting. Pass source_path and chunk_index from a search hit (path#N). Omit chunk_index to return every chunk in that file."
     )]
@@ -302,9 +357,15 @@ fn format_document(d: &crate::store::Document) -> String {
     } else {
         format!("Headings: {}\n", d.headings.join(" > "))
     };
+    let provenance = d
+        .metadata
+        .get("_chunk_id")
+        .and_then(|value| value.as_str())
+        .map(|id| format!("Chunk ID: {id}\n"))
+        .unwrap_or_default();
     format!(
-        "Citation: {}#{}\n{}---\n{}\n",
-        d.source_path, d.chunk_index, heading, d.text
+        "Citation: {}#{}\n{}{}---\n{}\n",
+        d.source_path, d.chunk_index, provenance, heading, d.text
     )
 }
 
@@ -315,13 +376,18 @@ fn format_hits(query: &str, hits: &[crate::search::ResultHit]) -> String {
         return out;
     }
     for (i, h) in hits.iter().enumerate() {
+        let chunk_id = h
+            .metadata
+            .get("_chunk_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         let heading = if h.headings.is_empty() {
             String::new()
         } else {
             format!(" [{}]", h.headings.join(" > "))
         };
         out.push_str(&format!(
-            "\n{}. score={:.4} (dense={:.4} lexical={:.4})  {}#{}{}\n{}\n",
+            "\n{}. score={:.4} (dense={:.4} lexical={:.4})  {}#{}{} id={}\n{}\n",
             i + 1,
             h.score,
             h.dense_score,
@@ -329,6 +395,7 @@ fn format_hits(query: &str, hits: &[crate::search::ResultHit]) -> String {
             h.source_path,
             h.chunk_index,
             heading,
+            chunk_id,
             h.text
         ));
     }

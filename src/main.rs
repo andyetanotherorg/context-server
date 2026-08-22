@@ -371,7 +371,7 @@ async fn run_serve(db_spec: String) -> Result<()> {
         .init();
 
     let db_path = remote::resolve_db(&db_spec).await?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let n = db.count()?;
     if n == 0 {
         bail!(
@@ -416,7 +416,7 @@ fn run_search(
         tag,
     };
     let db_path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let idx = search::Index::load(&db)?;
     if idx.is_empty() {
         bail!("database {} has no documents", db_path.display());
@@ -442,7 +442,7 @@ fn run_search(
 
 fn run_get(db_spec: String, path: String, chunk: Option<usize>) -> Result<()> {
     let db_path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let idx = search::Index::load(&db)?;
     match chunk {
         Some(i) => {
@@ -513,7 +513,7 @@ fn run_embed(text: Vec<String>) -> Result<()> {
 
 fn run_eval(db_spec: String, cases_path: PathBuf, limit: usize) -> Result<()> {
     let db_path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&db_path)?;
+    let db = store::Db::open_read_only(&db_path)?;
     let idx = search::Index::load(&db)?;
     let cases = eval::load_cases(&cases_path)?;
     let mut emb = embed::Embedder::new()?;
@@ -536,7 +536,7 @@ fn run_eval(db_spec: String, cases_path: PathBuf, limit: usize) -> Result<()> {
 
 fn run_status(db_spec: String, json: bool) -> Result<()> {
     let path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&path)?;
+    let db = store::Db::open_read_only(&path)?;
     if json {
         println!(
             "{}",
@@ -554,7 +554,7 @@ fn run_status(db_spec: String, json: bool) -> Result<()> {
 
 fn run_validate(db_spec: String) -> Result<()> {
     let path = remote::resolve_db_blocking(&db_spec)?;
-    let db = store::Db::open(&path)?;
+    let db = store::Db::open_read_only(&path)?;
     db.ensure_model_compatible()?;
     let result: String = db
         .conn
