@@ -1,6 +1,7 @@
 //! Markdown chunking and directory collection.
 
 use anyhow::{bail, Context, Result};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -15,7 +16,7 @@ pub const MAX_CHUNK_CHARS: usize = 1800;
 pub const CHUNK_OVERLAP_CHARS: usize = 200;
 /// Stored in DB meta; bump when chunking rules change so incremental index
 /// re-embeds even if file bytes look the same.
-pub const CHUNKER_VERSION: &str = "1";
+pub const CHUNKER_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -120,114 +121,99 @@ pub fn plan_index(
     plan
 }
 
-/// Split markdown into chunks on ## and ### boundaries.
+/// Split Markdown at structural heading boundaries. The CommonMark event parser
+/// ensures heading-looking lines inside fenced code blocks remain body content.
 pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
     let (metadata, content) = parse_front_matter(content);
-    let heading_re = Regex::new(r"^(#{1,6})\s+(.+?)\s*$").unwrap();
+    let mut headings_found: Vec<(usize, usize, usize, String)> = Vec::new();
+    let mut active: Option<(usize, usize, String)> = None;
 
-    let mut doc_title = String::new();
-    let mut h2 = String::new();
-    let mut h3 = String::new();
-    let mut body: Vec<String> = Vec::new();
-    let mut chunks: Vec<Chunk> = Vec::new();
-
-    let emit = |body: &mut Vec<String>,
-                doc_title: &str,
-                h2: &str,
-                h3: &str,
-                chunks: &mut Vec<Chunk>,
-                source_path: &str,
-                metadata: &serde_json::Map<String, serde_json::Value>| {
-        let text = body.join("\n").trim().to_string();
-        body.clear();
-        if text.is_empty() {
-            return;
-        }
-        let mut headings = Vec::new();
-        if !doc_title.is_empty() {
-            headings.push(doc_title.to_string());
-        }
-        if !h2.is_empty() {
-            headings.push(h2.to_string());
-        }
-        if !h3.is_empty() {
-            headings.push(h3.to_string());
-        }
-        let prefixed = if headings.is_empty() {
-            text.clone()
-        } else {
-            format!("{}\n\n{}", headings.join(" > "), text)
-        };
-        let idx = chunks.len();
-        chunks.push(Chunk {
-            source_path: source_path.to_string(),
-            chunk_index: idx,
-            text: prefixed,
-            headings,
-            metadata: metadata.clone(),
-        });
-    };
-
-    for line in content.lines() {
-        if let Some(caps) = heading_re.captures(line) {
-            let level = caps[1].len();
-            let title = caps[2].trim().to_string();
-            match level {
-                1 => {
-                    emit(
-                        &mut body,
-                        &doc_title,
-                        &h2,
-                        &h3,
-                        &mut chunks,
-                        source_path,
-                        &metadata,
-                    );
-                    doc_title = title;
-                    h2.clear();
-                    h3.clear();
-                }
-                2 => {
-                    emit(
-                        &mut body,
-                        &doc_title,
-                        &h2,
-                        &h3,
-                        &mut chunks,
-                        source_path,
-                        &metadata,
-                    );
-                    h2 = title;
-                    h3.clear();
-                }
-                3 => {
-                    emit(
-                        &mut body,
-                        &doc_title,
-                        &h2,
-                        &h3,
-                        &mut chunks,
-                        source_path,
-                        &metadata,
-                    );
-                    h3 = title;
-                }
-                _ => body.push(line.to_string()),
+    for (event, range) in Parser::new_ext(&content, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                active = Some((heading_level(level), range.start, String::new()));
             }
-            continue;
+            Event::Text(text) | Event::Code(text) if active.is_some() => {
+                if let Some((_, _, title)) = active.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, start, title)) = active.take() {
+                    headings_found.push((level, start, range.end, title.trim().to_string()));
+                }
+            }
+            _ => {}
         }
-        body.push(line.to_string());
     }
-    emit(
-        &mut body,
-        &doc_title,
-        &h2,
-        &h3,
-        &mut chunks,
+
+    let mut chunks = Vec::new();
+    let mut hierarchy: Vec<String> = Vec::new();
+    let mut body_start = 0usize;
+    for (level, heading_start, heading_end, title) in headings_found {
+        emit_section(
+            &content[body_start..heading_start],
+            &hierarchy,
+            source_path,
+            &metadata,
+            &mut chunks,
+        );
+        hierarchy.truncate(level.saturating_sub(1));
+        while hierarchy.len() < level.saturating_sub(1) {
+            hierarchy.push(String::new());
+        }
+        hierarchy.push(title);
+        body_start = heading_end;
+    }
+    emit_section(
+        &content[body_start..],
+        &hierarchy,
         source_path,
         &metadata,
+        &mut chunks,
     );
     split_oversized(chunks)
+}
+
+fn heading_level(level: HeadingLevel) -> usize {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn emit_section(
+    body: &str,
+    hierarchy: &[String],
+    source_path: &str,
+    metadata: &serde_json::Map<String, serde_json::Value>,
+    chunks: &mut Vec<Chunk>,
+) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    let headings: Vec<String> = hierarchy
+        .iter()
+        .filter(|h| !h.is_empty())
+        .cloned()
+        .collect();
+    let text = if headings.is_empty() {
+        body.to_string()
+    } else {
+        format!("{}\n\n{}", headings.join(" > "), body)
+    };
+    chunks.push(Chunk {
+        source_path: source_path.to_string(),
+        chunk_index: chunks.len(),
+        text,
+        headings,
+        metadata: metadata.clone(),
+    });
 }
 
 /// Split any chunk whose embedded text exceeds [`MAX_CHUNK_CHARS`], keeping the
@@ -300,74 +286,28 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
     }
     out
 }
+const MAX_FRONT_MATTER_BYTES: usize = 64 * 1024;
+
 fn parse_front_matter(content: &str) -> (serde_json::Map<String, serde_json::Value>, String) {
-    if !content.starts_with("---") {
+    if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
         return (serde_json::Map::new(), content.to_string());
     }
     let re = Regex::new(r"(?s)^---\r?\n(.*?)\r?\n---\r?\n?").unwrap();
-    if let Some(caps) = re.captures(content) {
-        let raw_yaml = &caps[1];
-        let remaining = &content[caps[0].len()..];
-        let mut meta = serde_json::Map::new();
-
-        let mut current_list_key: Option<String> = None;
-        let mut list_items: Vec<serde_json::Value> = Vec::new();
-
-        for line in raw_yaml.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            if let Some(item_raw) = trimmed.strip_prefix("- ") {
-                if let Some(ref _key) = current_list_key {
-                    let item = item_raw.trim().trim_matches('"').trim_matches('\'');
-                    list_items.push(serde_json::Value::String(item.to_string()));
-                    continue;
-                }
-            }
-
-            if let Some(key) = current_list_key.take() {
-                meta.insert(
-                    key,
-                    serde_json::Value::Array(std::mem::take(&mut list_items)),
-                );
-            }
-
-            if let Some((k, v)) = line.split_once(':') {
-                let k = k.trim().to_string();
-                let v = v.trim();
-                if v.is_empty() {
-                    current_list_key = Some(k);
-                    list_items.clear();
-                } else if (v.starts_with('[') && v.ends_with(']')) || v.contains(',') {
-                    let inner = v.trim_matches(|c| c == '[' || c == ']');
-                    let items: Vec<serde_json::Value> = inner
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| {
-                            serde_json::Value::String(
-                                s.trim_matches('"').trim_matches('\'').to_string(),
-                            )
-                        })
-                        .collect();
-                    meta.insert(k, serde_json::Value::Array(items));
-                } else {
-                    let scalar = v.trim_matches('"').trim_matches('\'');
-                    meta.insert(k, serde_json::Value::String(scalar.to_string()));
-                }
-            }
-        }
-
-        if let Some(key) = current_list_key.take() {
-            meta.insert(key, serde_json::Value::Array(list_items));
-        }
-
-        (meta, remaining.to_string())
-    } else {
-        (serde_json::Map::new(), content.to_string())
+    let Some(caps) = re.captures(content) else {
+        return (serde_json::Map::new(), content.to_string());
+    };
+    let raw_yaml = &caps[1];
+    if raw_yaml.len() > MAX_FRONT_MATTER_BYTES {
+        return (serde_json::Map::new(), content.to_string());
     }
+    let Ok(value) = serde_yaml_ng::from_str::<serde_json::Value>(raw_yaml) else {
+        return (serde_json::Map::new(), content.to_string());
+    };
+    let Some(metadata) = value.as_object().cloned() else {
+        return (serde_json::Map::new(), content.to_string());
+    };
+    let remaining = &content[caps[0].len()..];
+    (metadata, remaining.to_string())
 }
 
 pub fn heading_path(c: &Chunk) -> String {
@@ -539,6 +479,53 @@ Text.
         assert_eq!(chunks.len(), 1);
         let tags = chunks[0].metadata.get("tags").unwrap();
         assert_eq!(tags, &serde_json::json!(["devops", "infra", "kubevirt"]));
+    }
+
+    #[test]
+    fn headings_inside_fenced_code_are_not_structural() {
+        let md = "# Real Title\n\nBefore.\n\n```bash\n# shell comment\necho hi\n## another comment\n```\n\nAfter.\n";
+        let chunks = split_markdown("fenced.md", md);
+        assert_eq!(chunks.len(), 1, "{chunks:#?}");
+        assert_eq!(chunks[0].headings, ["Real Title"]);
+        assert!(chunks[0].text.contains("# shell comment"));
+        assert!(chunks[0].text.contains("After."));
+    }
+
+    #[test]
+    fn front_matter_preserves_comma_scalars() {
+        let md = "---\ntitle: \"Hello, world\"\ndescription: A doc about a, b, and c\ntags: [one, two]\n---\n# Doc\nBody.\n";
+        let chunks = split_markdown("meta.md", md);
+        assert_eq!(
+            chunks[0].metadata["title"],
+            serde_json::json!("Hello, world")
+        );
+        assert_eq!(
+            chunks[0].metadata["description"],
+            serde_json::json!("A doc about a, b, and c")
+        );
+        assert_eq!(
+            chunks[0].metadata["tags"],
+            serde_json::json!(["one", "two"])
+        );
+    }
+
+    #[test]
+    fn malformed_front_matter_is_preserved_as_body() {
+        let md = "---\ntags: [unterminated\n---\n# Doc\nBody.\n";
+        let chunks = split_markdown("bad.md", md);
+        assert!(chunks[0].metadata.is_empty());
+        assert!(chunks[0].text.contains("tags: [unterminated"));
+    }
+
+    #[test]
+    fn oversized_front_matter_is_preserved_as_body() {
+        let raw = "x".repeat(MAX_FRONT_MATTER_BYTES + 1);
+        let md = format!("---\ndescription: {raw}\n---\n# Doc\nBody.\n");
+        let chunks = split_markdown("large.md", &md);
+        assert!(chunks[0].metadata.is_empty());
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("description:")));
     }
 
     #[test]
