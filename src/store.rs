@@ -34,6 +34,11 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        // `serve` and `index` may share the same WAL DB. Without a busy timeout,
+        // a reader hitting a brief writer lock fails immediately with
+        // SQLITE_BUSY. A short retry window absorbs those transient write
+        // commits (fastembed indexing writes can overlap a read).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             r#"
 PRAGMA journal_mode=WAL;
