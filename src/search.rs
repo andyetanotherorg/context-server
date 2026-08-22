@@ -278,7 +278,7 @@ fn rank_by_scores(
     secondary: &[f32],
     limit: usize,
 ) -> Vec<ResultHit> {
-    let mut idxs: Vec<usize> = (0..docs.len()).collect();
+    let mut idxs: Vec<usize> = (0..docs.len()).filter(|&i| primary[i] > 0.0).collect();
     idxs.sort_by(|a, b| {
         primary[*b]
             .partial_cmp(&primary[*a])
@@ -477,5 +477,18 @@ mod tests {
         assert_eq!(all_a.len(), 2);
         assert_eq!(all_a[0].chunk_index, 0);
         assert_eq!(all_a[1].chunk_index, 1);
+    }
+
+    #[test]
+    fn rank_by_scores_filters_zeros() {
+        let docs = vec![
+            doc(1, "hit", vec![1.0, 0.0]),
+            doc(2, "zero", vec![0.0, 1.0]),
+        ];
+        let primary = vec![0.8, 0.0];
+        let secondary = vec![0.0, 0.0];
+        let ranked = rank_by_scores(&docs, &primary, &secondary, 5);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].source_path, "1.md");
     }
 }
