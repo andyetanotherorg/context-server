@@ -189,11 +189,11 @@ impl ContextService {
         let filter = filter_from(path_prefix, heading, tag);
         let mut emb = match self.embedder.lock() {
             Ok(e) => e,
-            Err(_) => return "error: embedder lock poisoned".into(),
+            Err(_) => return "error: embedder lock poisoned; restart the server".into(),
         };
         let index = match self.index.lock() {
             Ok(i) => i,
-            Err(_) => return "error: index lock poisoned".into(),
+            Err(_) => return "error: index lock poisoned; restart the server".into(),
         };
         match index.query_filtered(&mut emb, &query, limit, SearchMode::Hybrid, &filter) {
             Ok(hits) => format_hits(&query, &hits),
@@ -210,7 +210,10 @@ impl ContextService {
     ) -> String {
         let limit = limit.unwrap_or(50);
         self.refresh();
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(d) => d,
+            Err(_) => return "error: database lock poisoned; restart the server".into(),
+        };
         match db.list(limit, path_prefix.as_deref()) {
             Ok(filtered) => {
                 let mut out = format!("Showing {} document chunks:\n", filtered.len());
