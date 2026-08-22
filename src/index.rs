@@ -17,7 +17,7 @@ pub const MAX_CHUNK_TOKENS: usize = 450;
 pub const CHUNK_OVERLAP_CHARS: usize = 200;
 /// Stored in DB meta; bump when chunking rules change so incremental index
 /// re-embeds even if file bytes look the same.
-pub const CHUNKER_VERSION: &str = "2";
+pub const CHUNKER_VERSION: &str = "4";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -181,6 +181,23 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
         &metadata,
         &mut chunks,
     );
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for chunk in &mut chunks {
+        let base = chunk
+            .metadata
+            .get("_chunk_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("chunk")
+            .to_string();
+        let occurrence = seen.entry(base.clone()).or_default();
+        if *occurrence > 0 {
+            chunk.metadata.insert(
+                "_chunk_id".into(),
+                serde_json::Value::String(format!("{base}-occ{occurrence}")),
+            );
+        }
+        *occurrence += 1;
+    }
     split_oversized(chunks)
 }
 
@@ -293,6 +310,7 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
         }
 
         let mut start = 0usize;
+        let mut split_index = 0usize;
         while start < body_chars.len() {
             let mut end = (start + body_budget).min(body_chars.len());
             while end > start + 1 {
@@ -316,6 +334,16 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
             let piece: String = body_chars[start..end].iter().collect();
             let piece = piece.trim();
             if !piece.is_empty() {
+                let mut metadata = chunk.metadata.clone();
+                let parent_id = metadata
+                    .get("_chunk_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("chunk")
+                    .to_string();
+                metadata.insert(
+                    "_chunk_id".into(),
+                    serde_json::Value::String(format!("{parent_id}-{split_index}")),
+                );
                 let text = if prefix.is_empty() {
                     piece.to_string()
                 } else {
@@ -326,8 +354,9 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
                     chunk_index: 0, // renumbered below
                     text,
                     headings: chunk.headings.clone(),
-                    metadata: chunk.metadata.clone(),
+                    metadata,
                 });
+                split_index += 1;
             }
             if end >= body_chars.len() {
                 break;
@@ -615,6 +644,21 @@ Text.
                 target_after.metadata["_end_line"].as_u64()
             ),
             (Some(9), Some(11))
+        );
+    }
+
+    #[test]
+    fn identical_sections_receive_unique_stable_ids() {
+        let md = "# Doc\n\n## Same\n\nBody.\n\n## Same\n\nBody.\n";
+        let chunks = split_markdown("duplicates.md", md);
+        assert_eq!(chunks.len(), 2);
+        assert_ne!(
+            chunks[0].metadata["_chunk_id"],
+            chunks[1].metadata["_chunk_id"]
+        );
+        assert_eq!(
+            chunks[0].metadata["_chunk_id"],
+            split_markdown("duplicates.md", md)[0].metadata["_chunk_id"]
         );
     }
 

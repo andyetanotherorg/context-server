@@ -3,7 +3,7 @@
 use crate::embed::{self, MODEL_ID};
 use crate::index::{Chunk, CHUNKER_VERSION};
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -31,8 +31,11 @@ pub struct Db {
     pub(crate) conn: Connection,
 }
 
+const SCHEMA_VERSION: &str = "1";
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        let existed = path.exists();
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         // `serve` and `index` may share the same WAL DB. Without a busy timeout,
         // a reader hitting a brief writer lock fails immediately with
@@ -71,7 +74,64 @@ CREATE TABLE IF NOT EXISTS files (
 );
 "#,
         )?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        match db.get_meta("schema_version")? {
+            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) => bail!("unsupported schema_version {version:?}"),
+            None if existed && db.has_compatible_legacy_schema()? => {
+                db.set_meta("schema_version", SCHEMA_VERSION)?;
+                // Force the next index run to rebuild all chunks with current
+                // stable-ID/line-range semantics before readers accept it.
+                db.conn.execute("DELETE FROM meta WHERE key IN ('chunker_version', 'embedding_fingerprint')", [])?;
+            }
+            None if existed => bail!(
+                "database has no schema_version and its schema is incompatible; move it aside and re-run index"
+            ),
+            None => db.set_meta("schema_version", SCHEMA_VERSION)?,
+        }
+        Ok(db)
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let db = Self { conn };
+        let version = db
+            .get_meta("schema_version")?
+            .context("database has no schema_version; re-run index")?;
+        if version != SCHEMA_VERSION {
+            bail!("unsupported schema_version {version:?}");
+        }
+        Ok(db)
+    }
+
+    fn has_compatible_legacy_schema(&self) -> Result<bool> {
+        for (table, required) in [
+            (
+                "documents",
+                &[
+                    "id",
+                    "source_path",
+                    "chunk_index",
+                    "text",
+                    "headings",
+                    "metadata",
+                ][..],
+            ),
+            ("embeddings", &["id", "dim", "vector"][..]),
+            ("meta", &["key", "value"][..]),
+            ("files", &["source_path", "content_hash"][..]),
+        ] {
+            let mut statement = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns: HashSet<String> = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<_, _>>()?;
+            if !required.iter().all(|column| columns.contains(*column)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     #[allow(dead_code)]
