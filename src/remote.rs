@@ -216,7 +216,6 @@ async fn fetch_gcs_db(gcs: &GcsRef) -> Result<PathBuf> {
         .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
     let dest = cache_dir.join("context.db");
     let checksum_path = cache_dir.join("context.db.sha256");
-    let tmp = cache_dir.join("context.db.partial");
 
     let client = Storage::builder()
         .build()
@@ -254,6 +253,12 @@ async fn fetch_gcs_db(gcs: &GcsRef) -> Result<PathBuf> {
         gcs.object,
         dest.display()
     );
+
+    // Unique staging file: concurrent `resolve_db` calls for the same object
+    // must not trample each other's partial download. `fs::rename` below is
+    // atomic, so whichever finishes first wins and the other's rename simply
+    // replaces the (already-verified) destination.
+    let tmp = unique_partial_path(&cache_dir, &dest)?;
 
     let bucket = gcs.bucket_resource();
     let mut resp = client
@@ -297,6 +302,27 @@ async fn fetch_gcs_db(gcs: &GcsRef) -> Result<PathBuf> {
     Ok(dest)
 }
 
+/// A per-process-unique staging path under `cache_dir`, so concurrent fetches
+/// of the same remote object never overwrite each other's partial download.
+///
+/// Uniqueness comes from PID + a process-wide monotonic counter, not a racy
+/// `exists()` probe (two callers could otherwise pick the same free name).
+fn unique_partial_path(cache_dir: &Path, dest: &Path) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("context");
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(cache_dir.join(format!(
+        "{}.partial.{}.{}",
+        name,
+        std::process::id(),
+        counter
+    )))
+}
+
 fn cache_dir_for(gcs: &GcsRef) -> Result<PathBuf> {
     let base = dirs::cache_dir()
         .context("no cache directory (set XDG_CACHE_HOME or HOME)")?
@@ -309,6 +335,7 @@ fn cache_dir_for(gcs: &GcsRef) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_local_path() {
@@ -414,5 +441,21 @@ mod tests {
         );
         assert!(parse_sha256_text("not-a-hash").is_err());
         assert!(parse_sha256_text("").is_err());
+    }
+
+    #[test]
+    fn unique_partial_path_returns_distinct_staging_files() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("context.db");
+        let a = unique_partial_path(dir.path(), &dest).unwrap();
+        let b = unique_partial_path(dir.path(), &dest).unwrap();
+        // Same process, so the counter bumps to avoid collision.
+        assert!(a != b, "concurrent fetches must not share a staging file");
+        let prefix = format!("context.db.partial.{}", std::process::id());
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&prefix));
     }
 }

@@ -332,7 +332,7 @@ async fn run_serve(db_spec: String) -> Result<()> {
     }
     let index = search::Index::load(&db)?;
     let embedder = embed::Embedder::new()?;
-    let service = mcp::ContextService::new(db, index, embedder);
+    let service = mcp::ContextService::new(db, index, embedder, db_path.clone());
 
     eprintln!(
         "context-server: serving MCP stdio ({} chunks from {}, hybrid search, {})",
