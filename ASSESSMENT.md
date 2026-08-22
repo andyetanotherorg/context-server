@@ -704,6 +704,33 @@ Recommendation:
 6. Store vectors contiguously if profiling shows meaningful benefit.
 7. Add ANN only if measured exact-search latency becomes unacceptable.
 
+## Implementation completion matrix
+
+The findings in this assessment are addressed by the following verified changes:
+
+- Mixed index migrations: rejected unless complete `--sync` is used.
+- GCS cache integrity: cached database bytes are hashed directly.
+- Index semantics: safe upsert default, explicit destructive synchronization.
+- Empty corpus: explicit empty synchronization prunes stale rows.
+- Database access: read-only readers and explicit schema compatibility.
+- Embedding provenance: versioned, fail-closed fingerprint.
+- Markdown/YAML ingestion: structural Markdown parser and bounded real YAML decoding.
+- Citations: source-namespaced stable IDs and source line ranges.
+- Ranking correctness: lexical score attribution and deterministic ties.
+- Retrieval evaluation: golden cases with recall@k and MRR.
+- Lexical quality: Unicode and identifier component tokenization.
+- Relevance safeguards: dense threshold and per-source diversity cap.
+- MCP safety: hard result limits and offset pagination.
+- Diagnostics: status, JSON status, validation, model cache status/download.
+- Hot reload: committed index generation recorded transactionally.
+- Packaging: declared/tested MSRV, release and installed-wheel smoke tests.
+- Performance: repeatable 1k/10k/50k benchmark script and scale triggers.
+
+ANN/vector-database and SQLite FTS5 adoption remain conditional optimizations, not
+unresolved findings: benchmarks show the exact implementation is appropriate for
+the stated operating envelope. They should only be introduced when measured
+latency or memory crosses the documented trigger.
+
 ## Bottom line
 
 The project should retain its current overall architecture. It is simple, understandable, fast enough, and well matched to the expected workload.
