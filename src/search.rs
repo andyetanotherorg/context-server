@@ -278,9 +278,7 @@ fn rank_by_scores(
     secondary: &[f32],
     limit: usize,
 ) -> Vec<ResultHit> {
-    let mut idxs: Vec<usize> = (0..docs.len())
-        .filter(|&i| primary[i] > 0.0)
-        .collect();
+    let mut idxs: Vec<usize> = (0..docs.len()).filter(|&i| primary[i] > 0.0).collect();
     idxs.sort_by(|a, b| {
         primary[*b]
             .partial_cmp(&primary[*a])
