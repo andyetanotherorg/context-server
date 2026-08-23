@@ -38,7 +38,7 @@ context-server embed "<query>"   # query-style (BGE instruction)
 - `files`: source_path, content_hash (SHA-256 of that file's chunks)
 - `meta`: key/value (`model_id`, `dim`, `chunker_version`) — refuse search if model incompatible; re-embed all files if chunker/model changed
 
-`index` upserts changed files and deletes paths that left `--input`. `--full` re-embeds collected files; `--update` skips the prune.
+`index` upserts changed files by default and never prunes. `--full` re-embeds collected files; `--sync` is an explicit, destructive push-to-state that deletes indexed paths missing from `--input` and is required for model/chunker migrations.
 
 ## Chunking
 

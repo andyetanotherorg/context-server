@@ -125,11 +125,17 @@ pub fn plan_index(
 /// Split Markdown at structural heading boundaries. The CommonMark event parser
 /// ensures heading-looking lines inside fenced code blocks remain body content.
 pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
-    let (metadata, content) = parse_front_matter(content);
+    let (metadata, content, front_matter_lines) = parse_front_matter(content);
     let mut headings_found: Vec<(usize, usize, usize, String)> = Vec::new();
     let mut active: Option<(usize, usize, String)> = None;
 
-    for (event, range) in Parser::new_ext(&content, Options::all()).into_offset_iter() {
+    // Heading extraction parser: use explicit options that enable the structural
+    // parsing features needed to find headings and their text while excluding
+    // smart punctuation (which would rewrite heading text) and math (whose
+    // InlineMath/DisplayMath events aren't heading text and would distort ranges).
+    let heading_options =
+        Options::all().difference(Options::ENABLE_SMART_PUNCTUATION | Options::ENABLE_MATH);
+    for (event, range) in Parser::new_ext(&content, heading_options).into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 active = Some((heading_level(level), range.start, String::new()));
@@ -161,6 +167,7 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
             &hierarchy,
             source_path,
             &metadata,
+            front_matter_lines,
             &mut chunks,
         );
         hierarchy.truncate(level.saturating_sub(1));
@@ -179,6 +186,7 @@ pub fn split_markdown(source_path: &str, content: &str) -> Vec<Chunk> {
         &hierarchy,
         source_path,
         &metadata,
+        front_matter_lines,
         &mut chunks,
     );
     let mut seen = std::collections::HashMap::<String, usize>::new();
@@ -221,6 +229,7 @@ fn emit_section(
     hierarchy: &[String],
     source_path: &str,
     metadata: &serde_json::Map<String, serde_json::Value>,
+    front_matter_lines: usize,
     chunks: &mut Vec<Chunk>,
 ) {
     let body = body.trim();
@@ -242,16 +251,20 @@ fn emit_section(
         "_chunk_id".into(),
         serde_json::Value::String(stable_chunk_id(source_path, &headings, body)),
     );
+    // front matter is stripped before chunking, so offset the reported source
+    // line numbers by the number of lines the front matter consumed.
     metadata.insert(
         "_start_line".into(),
-        serde_json::json!(line_at(full_content, section_start)),
+        serde_json::json!(line_at(full_content, section_start) + front_matter_lines),
     );
     metadata.insert(
         "_end_line".into(),
-        serde_json::json!(line_at(
-            full_content,
-            section_start + full_content[section_start..section_end].trim_end().len()
-        )),
+        serde_json::json!(
+            line_at(
+                full_content,
+                section_start + full_content[section_start..section_end].trim_end().len()
+            ) + front_matter_lines
+        ),
     );
     chunks.push(Chunk {
         source_path: source_path.to_string(),
@@ -286,7 +299,9 @@ fn line_at(content: &str, byte_offset: usize) -> usize {
 fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
     let mut out = Vec::new();
     for chunk in chunks {
-        if chunk.text.chars().count() <= MAX_CHUNK_CHARS {
+        let over_chars = chunk.text.chars().count() > MAX_CHUNK_CHARS;
+        let over_tokens = crate::embed::estimated_tokens(&chunk.text) > MAX_CHUNK_TOKENS;
+        if !over_chars && !over_tokens {
             out.push(chunk);
             continue;
         }
@@ -300,6 +315,9 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
             .strip_prefix(&prefix)
             .unwrap_or(chunk.text.as_str());
         let prefix_len = prefix.chars().count();
+        // The emitted piece is `prefix + body_piece`, so both the character
+        // budget and the token budget must fit the heading prefix too.
+        let prefix_tokens = crate::embed::estimated_tokens(&prefix);
         let body_budget = MAX_CHUNK_CHARS.saturating_sub(prefix_len).max(200);
         let overlap = CHUNK_OVERLAP_CHARS.min(body_budget / 3);
 
@@ -315,7 +333,7 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
             let mut end = (start + body_budget).min(body_chars.len());
             while end > start + 1 {
                 let candidate: String = body_chars[start..end].iter().collect();
-                if crate::embed::estimated_tokens(&candidate) <= MAX_CHUNK_TOKENS {
+                if crate::embed::estimated_tokens(&candidate) + prefix_tokens <= MAX_CHUNK_TOKENS {
                     break;
                 }
                 end = start + ((end - start) * 9 / 10).max(1);
@@ -372,26 +390,32 @@ fn split_oversized(chunks: Vec<Chunk>) -> Vec<Chunk> {
 }
 const MAX_FRONT_MATTER_BYTES: usize = 64 * 1024;
 
-fn parse_front_matter(content: &str) -> (serde_json::Map<String, serde_json::Value>, String) {
+fn parse_front_matter(
+    content: &str,
+) -> (serde_json::Map<String, serde_json::Value>, String, usize) {
+    let no_meta = (serde_json::Map::new(), content.to_string(), 0);
     if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
-        return (serde_json::Map::new(), content.to_string());
+        return no_meta;
     }
     let re = Regex::new(r"(?s)^---\r?\n(.*?)\r?\n---\r?\n?").unwrap();
     let Some(caps) = re.captures(content) else {
-        return (serde_json::Map::new(), content.to_string());
+        return no_meta;
     };
     let raw_yaml = &caps[1];
     if raw_yaml.len() > MAX_FRONT_MATTER_BYTES {
-        return (serde_json::Map::new(), content.to_string());
+        return no_meta;
     }
     let Ok(value) = serde_yaml_ng::from_str::<serde_json::Value>(raw_yaml) else {
-        return (serde_json::Map::new(), content.to_string());
+        return no_meta;
     };
     let Some(metadata) = value.as_object().cloned() else {
-        return (serde_json::Map::new(), content.to_string());
+        return no_meta;
     };
+    // Number of newlines consumed by the front matter block (the `---` fences
+    // plus the YAML body). Source line metadata must be offset by this amount.
+    let lines = caps[0].matches('\n').count();
     let remaining = &content[caps[0].len()..];
-    (metadata, remaining.to_string())
+    (metadata, remaining.to_string(), lines)
 }
 
 pub fn heading_path(c: &Chunk) -> String {
@@ -672,6 +696,16 @@ Text.
     }
 
     #[test]
+    fn source_line_ranges_account_for_stripped_front_matter() {
+        // 3 front-matter lines (two fences + the title) are stripped before
+        // chunking, so the reported source line numbers must be offset by 3.
+        let md = "---\ntitle: Doc\n---\n# Doc\n\nBody.\n";
+        let chunks = split_markdown("fm.md", md);
+        assert_eq!(chunks[0].metadata["_start_line"].as_u64(), Some(4));
+        assert_eq!(chunks[0].metadata["_end_line"].as_u64(), Some(6));
+    }
+
+    #[test]
     fn empty_sections_skipped() {
         let md = "# Title\n\n## Empty\n\n## Has Content\n\nHello.\n";
         let chunks = split_markdown("x.md", md);
@@ -702,6 +736,23 @@ Text.
                 c.text.chars().count()
             );
             assert!(c.text.contains("Doc > Big") || c.headings.contains(&"Big".into()));
+        }
+    }
+
+    #[test]
+    fn short_tokens_over_token_cap_are_split_even_below_char_cap() {
+        // Many one-character tokens: well under MAX_CHUNK_CHARS but over
+        // MAX_CHUNK_TOKENS, which previously slipped through unsplit.
+        let long = "a ".repeat(900); // 1800 chars, 900 tokens
+        let md = format!("# Doc\n\n{long}");
+        let chunks = split_markdown("tokens.md", &md);
+        assert!(chunks.len() > 1, "expected split, got {}", chunks.len());
+        for c in &chunks {
+            assert!(
+                crate::embed::estimated_tokens(&c.text) <= MAX_CHUNK_TOKENS + 20,
+                "chunk too many tokens: {}",
+                crate::embed::estimated_tokens(&c.text)
+            );
         }
     }
 

@@ -331,11 +331,22 @@ impl ContextService {
                 if docs.is_empty() {
                     return format!("error: no chunks for {path}");
                 }
-                let mut out = format!("{} chunk(s) in {path}:\n", docs.len());
-                for d in docs {
+                // Bound the returned source to keep MCP responses within a hard
+                // limit even when chunk_index is omitted (a large file would
+                // otherwise produce an unbounded response).
+                const MAX_CHUNKS: usize = 50;
+                let shown = docs.len().min(MAX_CHUNKS);
+                let mut out = format!("{shown} of {} chunk(s) in {path}:\n", docs.len());
+                for d in &docs[..shown] {
                     out.push('\n');
                     out.push_str(&format_document(d));
                     out.push('\n');
+                }
+                if docs.len() > shown {
+                    out.push_str(&format!(
+                        "\n… {} more chunk(s). Use chunk_index or get_chunk_by_id to fetch a specific one.\n",
+                        docs.len() - shown
+                    ));
                 }
                 out
             }

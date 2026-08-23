@@ -286,13 +286,23 @@ fn hybrid_rrf(docs: &[Document], dense: &[f32], lexical: &[f32], limit: usize) -
     let dense_rank = top_ids(dense, pool);
     let lex_rank = top_ids(lexical, pool);
     // If one side is all zeros, fall back to the other.
-    let fused = if dense_rank.is_empty() {
+    let mut fused = if dense_rank.is_empty() {
         lex_rank.into_iter().map(|i| (i, lexical[i])).collect()
     } else if lex_rank.is_empty() {
         dense_rank.into_iter().map(|i| (i, dense[i])).collect()
     } else {
         reciprocal_rank_fusion(&[dense_rank, lex_rank], RRF_K)
     };
+    // Deterministic tie-breaker: equal RRF scores otherwise retain the
+    // nondeterministic iteration order from reciprocal_rank_fusion, which makes
+    // the per-source limit pick different chunks across runs.
+    fused.sort_by(|(a, a_score), (b, b_score)| {
+        b_score
+            .partial_cmp(a_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| docs[*a].source_path.cmp(&docs[*b].source_path))
+            .then_with(|| docs[*a].chunk_index.cmp(&docs[*b].chunk_index))
+    });
     let mut per_source = std::collections::HashMap::<&str, usize>::new();
     fused
         .into_iter()

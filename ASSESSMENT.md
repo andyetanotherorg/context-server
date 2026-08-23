@@ -653,7 +653,7 @@ Recommendation:
 
 ### Phase 1: Persisted-index correctness and safety
 
-1. Reject `--update` during model/chunker migrations.
+1. Reject incremental indexing during model/chunker migrations, requiring a complete `--sync`.
 2. Add the mixed-generation regression test.
 3. Hash the actual cached GCS database on cache hits.
 4. Separate `add` from destructive `sync` semantics.
